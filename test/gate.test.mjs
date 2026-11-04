@@ -100,6 +100,17 @@ created({ agent: makeAgent('session-c', calls), source: 'fresh' })
 await new Promise((resolve) => setTimeout(resolve, 20))
 console.log('created payload.agent restrictCalls =', calls.length - before, calls.length - before === 1 ? 'OK' : 'FAIL (payload destructuring)')
 
+// A conversation that predates the plugin carries no record. Resuming it must
+// NOT adopt the default toolset: trimming it would also write an applied record,
+// which makes the change permanent and makes the session read as 基础档 forever.
+// That is exactly how pre-plugin conversations were being rewritten.
+const beforeResume = calls.length
+created({ agent: makeAgent('session-old', calls), source: 'resume' })
+await new Promise((resolve) => setTimeout(resolve, 20))
+console.log('resume of an old session restrictCalls =', calls.length - beforeResume, calls.length === beforeResume ? 'OK (left untrimmed)' : 'FAIL (rewrote a pre-plugin session)')
+const afterResume = JSON.parse(fs.readFileSync(path.join(home, 'state', 'mode-switch', 'sessions.json'), 'utf8'))
+console.log('resume of an old session writes no record =', afterResume['session-old'] === undefined ? 'OK' : 'FAIL (persisted the default)')
+
 // Prompt sections: a toolset that denies `<family>_*` also drops the prompt
 // section the same plugin contributes (lunheng appends `{ name: 'lunheng' }`).
 const basic = { id: 'mode-basic', deny: ['mcp__solidworks__*', 'lunheng_*'] }
