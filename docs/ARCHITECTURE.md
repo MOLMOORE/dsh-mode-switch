@@ -19,6 +19,8 @@ client.js  ──GET /status──▶  index.js ──▶ tools.schemas(agent) /
     │                            │
     ├──GET /detail───────────────┤
     ├──GET /verify───────────────┤──▶ session-log.js ──▶ sessions/<ws>/<id>/session.v4.jsonl.zstd
+    ├──POST /modes───────────────┤──▶ catalog.json（整表校验后写临时文件再 rename）
+    ├──POST /auto────────────────┤──▶ auto.js ──▶ llm.stream（默认路由，只提案不写盘）
     └──POST /select──────────────┘  → sessions.json（仅未开始的会话）
 ```
 

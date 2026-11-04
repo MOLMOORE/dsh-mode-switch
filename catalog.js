@@ -62,6 +62,67 @@ export function loadCatalog(log) {
   }
 }
 
+/**
+ * Validate one submitted mode list.
+ *
+ * The editor sends the complete list (adds, renames, deletions and tool picks),
+ * so this is the only place that decides what a writable catalog looks like:
+ * unique slug ids, a name, and deny patterns that are plain strings.
+ *
+ * @returns `{ modes }` on success, `{ error }` otherwise.
+ */
+export function normalizeModes(input) {
+  if (!Array.isArray(input)) return { error: 'modes must be an array' }
+  const seen = new Set()
+  const modes = []
+  for (const [index, raw] of input.entries()) {
+    const name = typeof raw?.name === 'string' ? raw.name.trim() : ''
+    if (name === '') return { error: `mode #${index + 1} needs a name` }
+    const wanted = typeof raw?.id === 'string' ? raw.id.trim() : ''
+    const id = wanted === '' ? `mode-custom-${index + 1}` : wanted
+    if (!/^[a-z0-9][a-z0-9_-]*$/i.test(id)) return { error: `invalid mode id: ${id}` }
+    if (seen.has(id)) return { error: `duplicate mode id: ${id}` }
+    seen.add(id)
+    const deny = Array.isArray(raw?.deny)
+      ? raw.deny
+          .filter((pattern) => typeof pattern === 'string' && pattern.trim() !== '')
+          .map((pattern) => pattern.trim())
+          .slice(0, 2000)
+      : []
+    const order = Number.isFinite(raw?.order) ? raw.order : (index + 1) * 10
+    modes.push({ id, name: name.slice(0, 40), order, deny })
+  }
+  if (modes.length === 0) return { error: 'at least one mode is required' }
+  return { modes }
+}
+
+/** Read a bounded JSON request body. */
+function readJsonBody(req, limit = 256 * 1024) {
+  return new Promise((resolve, reject) => {
+    let text = ''
+    req.setEncoding?.('utf8')
+    req.on('data', (chunk) => {
+      text += chunk
+      if (text.length > limit) {
+        reject(new Error('payload-too-large'))
+        req.destroy?.()
+      }
+    })
+    req.on('end', () => {
+      if (text === '') {
+        resolve({})
+        return
+      }
+      try {
+        resolve(JSON.parse(text))
+      } catch {
+        reject(new Error('invalid-json'))
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
 /** `name*` matches a prefix; anything else matches exactly. */
 export function matchesAny(toolName, patterns) {
   for (const pattern of patterns ?? []) {

@@ -11,6 +11,7 @@ process.env.DSH_HOME = home
 const { apply, sectionFamilies, trimPromptSections, pruneSessions, resolveModeId, normalizeModes } = await import('../index.js')
 const { loadCatalog } = await import('../catalog.js')
 const { requestEvidence } = await import('../session-log.js')
+const { buildAutoPrompt, parseModesJson } = await import('../auto.js')
 
 const tools = [
   { name: 'mcp__solidworks__solidworks_connect' },
@@ -201,6 +202,18 @@ console.log('bad id rejected =', normalizeModes([{ id: 'no spaces', name: 'X' }]
 console.log('empty list rejected =', normalizeModes([]).error !== undefined ? 'OK' : 'FAIL')
 const fallback = resolveModeId({ modes: [{ id: 'mode-z', name: 'Z', order: 20 }, { id: 'mode-y', name: 'Y', order: 10 }] }, 'mode-deleted')
 console.log('deleted mode falls back to first by order =', fallback === 'mode-y' ? 'OK' : `FAIL (${fallback})`)
+
+// AI proposal: the prompt must carry real tool names and demand JSON; the
+// parser must survive fences and prose, and reject unusable answers.
+const autoPrompt = buildAutoPrompt([{ name: 'ppt_make', description: 'create slides' }, { name: 'fs_read' }], [])
+console.log('auto prompt lists tools =', autoPrompt.user.includes('ppt_make') && autoPrompt.user.includes('fs_read') ? 'OK' : 'FAIL')
+console.log('auto prompt demands json =', /STRICT JSON/.test(autoPrompt.system) ? 'OK' : 'FAIL')
+const fenced = parseModesJson('```json\n{"reason":"按用途分组","modes":[{"id":"mode-a","name":"日常","deny":["ppt_*"]},{"id":"mode-b","name":"全部","deny":[]}]}\n```')
+console.log('auto parses fenced json =', fenced.modes?.length === 2 && fenced.modes[0].deny?.[0] === 'ppt_*' ? 'OK' : 'FAIL')
+const chattered = parseModesJson('好的，这是方案：{"modes":[{"id":"mode-a","name":"日常","deny":[]}]} 希望有帮助。')
+console.log('auto parses prose-wrapped json =', chattered.modes?.length === 1 ? 'OK' : 'FAIL')
+console.log('auto rejects non-json =', parseModesJson('没有 JSON').error !== undefined ? 'OK' : 'FAIL')
+console.log('auto rejects invalid modes =', parseModesJson('{"modes":[]}').error !== undefined ? 'OK' : 'FAIL')
 console.log('existing mode kept =', resolveModeId({ modes: [{ id: 'mode-z', name: 'Z', order: 20 }] }, 'mode-z') === 'mode-z' ? 'OK' : 'FAIL')
 
 

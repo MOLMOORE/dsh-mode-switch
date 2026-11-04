@@ -38,6 +38,10 @@ window.__ModuleLoader__.load({
       'panel.edit': '编辑档位',
       'panel.edit.done': '完成',
       'panel.edit.add': '新建档位',
+      'panel.edit.auto': 'AI 分配',
+      'panel.edit.auto.busy': '分析中…',
+      'panel.edit.auto.done': 'AI 已按当前工具给出方案，确认后点保存',
+      'panel.edit.auto.failed': 'AI 分配失败：',
       'panel.edit.delete': '删除该档',
       'panel.edit.name': '名称',
       'panel.edit.search': '搜索工具',
@@ -93,6 +97,10 @@ window.__ModuleLoader__.load({
       'panel.edit': 'Edit modes',
       'panel.edit.done': 'Done',
       'panel.edit.add': 'New mode',
+      'panel.edit.auto': 'AI assign',
+      'panel.edit.auto.busy': 'Analysing…',
+      'panel.edit.auto.done': 'The model proposed a set for these tools; review and save',
+      'panel.edit.auto.failed': 'AI assign failed: ',
       'panel.edit.delete': 'Delete this mode',
       'panel.edit.name': 'Name',
       'panel.edit.search': 'Search tools',
@@ -427,6 +435,16 @@ window.__ModuleLoader__.load({
             ),
           ),
           h('button', { type: 'button', style: button, onClick: props.onAdd }, `+ ${t('panel.edit.add')}`),
+          h(
+            'button',
+            {
+              type: 'button',
+              disabled: props.autoBusy,
+              onClick: props.onAuto,
+              style: { ...button, opacity: props.autoBusy ? 0.5 : 1 },
+            },
+            props.autoBusy ? t('panel.edit.auto.busy') : t('panel.edit.auto'),
+          ),
         ),
         h(
           'div',
@@ -605,6 +623,7 @@ window.__ModuleLoader__.load({
       const [activeId, setActiveId] = React.useState(undefined)
       const [search, setSearch] = React.useState('')
       const [saving, setSaving] = React.useState(false)
+      const [autoBusy, setAutoBusy] = React.useState(false)
       const [note, setNote] = React.useState(undefined)
 
       const activeDraft = draft.find((mode) => mode.id === activeId) ?? draft[0]
@@ -680,6 +699,32 @@ window.__ModuleLoader__.load({
               },
               onAll: (on) => patchActive({ deny: buildDeny(activeDraft, names, on ? new Set(names) : new Set()) }),
               onSearch: setSearch,
+              autoBusy,
+              onAuto: async () => {
+                setAutoBusy(true)
+                setNote(undefined)
+                try {
+                  const response = await fetch('/api/mode-switch/auto', { method: 'POST' })
+                  const payload = await response.json().catch(() => undefined)
+                  if (!response.ok || payload?.ok !== true) throw new Error(payload?.reason ?? String(response.status))
+                  const next = (payload.modes ?? []).map((mode) => ({
+                    id: mode.id,
+                    name: mode.name,
+                    order: mode.order ?? 0,
+                    deny: [...(mode.deny ?? [])],
+                  }))
+                  setDraft(next)
+                  setActiveId(next[0]?.id)
+                  setNote({
+                    kind: 'ok',
+                    text: `${t('panel.edit.auto.done')}${payload.reason ? ` · ${payload.reason}` : ''}`,
+                  })
+                } catch (error) {
+                  setNote({ kind: 'error', text: `${t('panel.edit.auto.failed')}${error?.message ?? error}` })
+                } finally {
+                  setAutoBusy(false)
+                }
+              },
               onCancel: () => {
                 setEditing(false)
                 setNote(undefined)
