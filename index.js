@@ -49,6 +49,37 @@ export function apply(ctx) {
   const diag = { lastError: null, applied: [] }
   catalog.diag = diag
 
+  /** Per-plugin state directory, next to catalog.json. */
+  const stateDir = () => path.dirname(catalogPath())
+
+  /**
+   * Heartbeat: rewrite one tiny file every 5s.
+   *
+   * The host is single-threaded, so a frozen UI usually means the loop stopped
+   * turning. `diag` lives in memory and dies with the process, so a freeze
+   * leaves nothing behind. The heartbeat's mtime marks the last healthy moment,
+   * which survives a restart and makes the gap measurable.
+   */
+  try {
+    const beat = () => {
+      try {
+        fs.writeFileSync(
+          path.join(stateDir(), 'heartbeat.json'),
+          `${JSON.stringify({ at: new Date().toISOString(), pid: process.pid })}\n`,
+          'utf8',
+        )
+      } catch {
+        // A heartbeat that cannot be written is not worth a crash.
+      }
+    }
+    beat()
+    const timer = setInterval(beat, 5000)
+    timer.unref?.()
+  } catch {
+    // Older hosts without a writable state dir simply skip the heartbeat.
+  }
+
+
   /**
    * Re-read the user-editable catalog. `loadCatalog` memoises by mtime+size, so
    * this is a stat per call, not a parse; an edit takes effect on the next
@@ -218,6 +249,15 @@ export function apply(ctx) {
         diag.slow.push({ label, ms, at: new Date().toISOString() })
         if (diag.slow.length > 20) diag.slow.shift()
         log(`slow ${label}: ${ms}ms`)
+        try {
+          fs.appendFileSync(
+            path.join(stateDir(), 'slow.log'),
+            `${new Date().toISOString()} ${label} ${ms}ms\n`,
+            'utf8',
+          )
+        } catch {
+          // The in-memory copy still reaches the status route.
+        }
       }
     }
   }
