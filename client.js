@@ -193,10 +193,24 @@ window.__ModuleLoader__.load({
           return undefined
         }
         let cancelled = false
+        let settleTimer
+        let settleTries = 0
         const load = () => {
           fetchJson('/api/mode-switch/status', sessionId)
             .then((data) => {
-              if (!cancelled) setState({ phase: 'ready', data })
+              if (cancelled) return
+              setState({ phase: 'ready', data })
+              // The chip is read the instant a conversation is clicked, which is
+              // before the host has attached an agent to it. Poll quickly until a
+              // name shows up instead of leaving 读取中 for a whole 8s interval.
+              const unnamed = typeof data?.toolsetName !== 'string' && typeof data?.preset !== 'string'
+              if (unnamed && settleTries < 6) {
+                settleTries += 1
+                clearTimeout(settleTimer)
+                settleTimer = setTimeout(load, 1500)
+                return
+              }
+              settleTries = 0
             })
             .catch(() => {
               if (!cancelled) setState((previous) => (previous.phase === 'ready' ? previous : { phase: 'error', data: undefined }))
@@ -209,6 +223,7 @@ window.__ModuleLoader__.load({
         return () => {
           cancelled = true
           clearInterval(timer)
+          clearTimeout(settleTimer)
           window.removeEventListener('focus', onFocus)
         }
       }, [sessionId, nonce])
@@ -931,14 +946,20 @@ window.__ModuleLoader__.load({
       const title = t('chip.title')
       const panelId = `mode-switch-panel-${props.sessionId ?? 'none'}`
 
-      const settled = phase === 'ready' && typeof data?.preset === 'string' && data.preset !== ''
+      // The toolset name is the chip's subject; the preset only decorates a live
+      // session. Waiting for `preset` made a conversation opened from history
+      // read as 未知档 until its agent happened to come alive — the host only
+      // attaches an agent once something happens in the conversation.
+      const named = data?.toolsetName ?? data?.presetName ?? presetLabel(t, data?.preset)
+      const settled = phase === 'ready' && typeof named === 'string' && named !== ''
       const label = (() => {
         if (phase === 'no-session') return t('chip.noSession')
         if (phase === 'error') return t('chip.error')
         if (phase === 'loading') return t('chip.loading')
-        // A live session whose preset has not resolved yet is still mounting.
-        if (!settled) return data?.live === false ? t('chip.unknownMode') : t('chip.loading')
-        return data?.toolsetName ?? data?.presetName ?? presetLabel(t, data.preset) ?? t('chip.unknownMode')
+        // Nothing named yet: only a session the host does not know is unknown —
+        // one that is merely still opening stays on 读取中.
+        if (!settled) return data?.session === 'unknown' ? t('chip.unknownMode') : t('chip.loading')
+        return named
       })()
 
       const modes = phase === 'ready' && Array.isArray(data?.toolsets) ? data.toolsets : []
