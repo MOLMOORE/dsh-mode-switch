@@ -164,6 +164,27 @@ window.__ModuleLoader__.load({
       return `${path}?sessionId=${encodeURIComponent(sessionId)}`
     }
 
+    /**
+     * Fetch one JSON document with a hard timeout.
+     *
+     * A busy host can accept the request and answer minutes later; without a
+     * timeout the chip sits on "reading" and looks broken until the user
+     * switches conversations. Aborting turns that into a visible error the
+     * periodic retry can recover from.
+     */
+    function fetchJson(path, sessionId, timeoutMs = 8000) {
+      const controller = typeof AbortController === 'function' ? new AbortController() : undefined
+      const timer = controller === undefined ? undefined : setTimeout(() => controller.abort(), timeoutMs)
+      return fetch(endpoint(path, sessionId), {
+        cache: 'no-store',
+        ...(controller === undefined ? {} : { signal: controller.signal }),
+      })
+        .then((response) => (response.ok ? response.json() : Promise.reject(new Error(String(response.status)))))
+        .finally(() => {
+          if (timer !== undefined) clearTimeout(timer)
+        })
+    }
+
     function useStatus(sessionId, nonce) {
       const [state, setState] = React.useState({ phase: 'loading', data: undefined })
       React.useEffect(() => {
@@ -173,8 +194,7 @@ window.__ModuleLoader__.load({
         }
         let cancelled = false
         const load = () => {
-          fetch(endpoint('/api/mode-switch/status', sessionId), { cache: 'no-store' })
-            .then((response) => (response.ok ? response.json() : Promise.reject(new Error(String(response.status)))))
+          fetchJson('/api/mode-switch/status', sessionId)
             .then((data) => {
               if (!cancelled) setState({ phase: 'ready', data })
             })
@@ -183,7 +203,7 @@ window.__ModuleLoader__.load({
             })
         }
         load()
-        const timer = setInterval(load, 15000)
+        const timer = setInterval(load, 8000)
         const onFocus = () => load()
         window.addEventListener('focus', onFocus)
         return () => {
@@ -201,8 +221,7 @@ window.__ModuleLoader__.load({
         if (!open || !sessionId) return undefined
         let cancelled = false
         setState((previous) => (previous.phase === 'ready' ? previous : { phase: 'loading', data: undefined }))
-        fetch(endpoint('/api/mode-switch/detail', sessionId), { cache: 'no-store' })
-          .then((response) => (response.ok ? response.json() : Promise.reject(new Error(String(response.status)))))
+        fetchJson('/api/mode-switch/detail', sessionId)
           .then((data) => {
             if (!cancelled) setState({ phase: 'ready', data })
           })
@@ -223,8 +242,7 @@ window.__ModuleLoader__.load({
         if (!open || !sessionId) return undefined
         let cancelled = false
         setState({ phase: 'loading', data: undefined })
-        fetch(endpoint('/api/mode-switch/verify', sessionId), { cache: 'no-store' })
-          .then((response) => (response.ok ? response.json() : Promise.reject(new Error(String(response.status)))))
+        fetchJson('/api/mode-switch/verify', sessionId)
           .then((data) => {
             if (!cancelled) setState({ phase: 'ready', data })
           })
