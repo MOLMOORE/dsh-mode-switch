@@ -17,8 +17,11 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { catalogPath, loadCatalog, matchesAny } from './catalog.js'
+import { catalogPath, loadCatalog, matchesAny, normalizeModes } from './catalog.js'
 import { sessionEvidence } from './session-log.js'
+import { suggestModes } from './auto.js'
+
+export { normalizeModes } from './catalog.js'
 
 export const name = 'mode-switch'
 
@@ -30,6 +33,7 @@ const DETAIL_PATH = '/api/mode-switch/detail'
 const SELECT_PATH = '/api/mode-switch/select'
 const VERIFY_PATH = '/api/mode-switch/verify'
 const MODES_PATH = '/api/mode-switch/modes'
+const AUTO_PATH = '/api/mode-switch/auto'
 
 /** Rough token estimate: one token per four characters of the serialized schema. */
 const CHARS_PER_TOKEN = 4
@@ -307,6 +311,48 @@ export function apply(ctx) {
     () =>
       ctx.webServer.register({
         kind: 'exact',
+        path: AUTO_PATH,
+        handler: async (req, res) => {
+          let status = 200
+          let payload
+          try {
+            if (req.method !== 'POST') {
+              status = 405
+              payload = { ok: false, reason: 'method-not-allowed' }
+            } else {
+              const started = Date.now()
+              const result = await suggestModes(ctx, globalSchemas(ctx), catalog.modes)
+              diag.auto = {
+                at: new Date().toISOString(),
+                ms: Date.now() - started,
+                ok: result.error === undefined,
+                ...(result.error === undefined ? {} : { error: result.error }),
+                ...(result.reason === undefined ? {} : { reason: result.reason }),
+                ...(result.route === undefined ? {} : { route: result.route }),
+              }
+              if (result.error !== undefined) {
+                status = 502
+                payload = { ok: false, reason: result.error }
+              } else {
+                payload = { ok: true, modes: result.modes, reason: result.reason ?? '', route: result.route }
+              }
+            }
+          } catch (error) {
+            status = 500
+            payload = { ok: false, reason: error instanceof Error ? error.message : String(error) }
+          }
+          res.statusCode = status
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.setHeader('cache-control', 'no-store')
+          res.end(JSON.stringify(payload))
+        },
+      }),
+    'mode-switch: auto route',
+  )
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
         path: MODES_PATH,
         handler: async (req, res) => {
           let status = 200
@@ -408,67 +454,6 @@ export function resolveModeId(catalog, wanted) {
   if (typeof wanted === 'string' && modes.some((entry) => entry.id === wanted)) return wanted
   const first = [...modes].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))[0]
   return first?.id ?? wanted ?? DEFAULT_TOOLSET
-}
-
-/**
- * Validate one submitted mode list.
- *
- * The editor sends the complete list (adds, renames, deletions and tool picks),
- * so this is the only place that decides what a writable catalog looks like:
- * unique slug ids, a name, and deny patterns that are plain strings.
- *
- * @returns `{ modes }` on success, `{ error }` otherwise.
- */
-export function normalizeModes(input) {
-  if (!Array.isArray(input)) return { error: 'modes must be an array' }
-  const seen = new Set()
-  const modes = []
-  for (const [index, raw] of input.entries()) {
-    const name = typeof raw?.name === 'string' ? raw.name.trim() : ''
-    if (name === '') return { error: `mode #${index + 1} needs a name` }
-    const wanted = typeof raw?.id === 'string' ? raw.id.trim() : ''
-    const id = wanted === '' ? `mode-custom-${index + 1}` : wanted
-    if (!/^[a-z0-9][a-z0-9_-]*$/i.test(id)) return { error: `invalid mode id: ${id}` }
-    if (seen.has(id)) return { error: `duplicate mode id: ${id}` }
-    seen.add(id)
-    const deny = Array.isArray(raw?.deny)
-      ? raw.deny
-          .filter((pattern) => typeof pattern === 'string' && pattern.trim() !== '')
-          .map((pattern) => pattern.trim())
-          .slice(0, 2000)
-      : []
-    const order = Number.isFinite(raw?.order) ? raw.order : (index + 1) * 10
-    modes.push({ id, name: name.slice(0, 40), order, deny })
-  }
-  if (modes.length === 0) return { error: 'at least one mode is required' }
-  return { modes }
-}
-
-/** Read a bounded JSON request body. */
-function readJsonBody(req, limit = 256 * 1024) {
-  return new Promise((resolve, reject) => {
-    let text = ''
-    req.setEncoding?.('utf8')
-    req.on('data', (chunk) => {
-      text += chunk
-      if (text.length > limit) {
-        reject(new Error('payload-too-large'))
-        req.destroy?.()
-      }
-    })
-    req.on('end', () => {
-      if (text === '') {
-        resolve({})
-        return
-      }
-      try {
-        resolve(JSON.parse(text))
-      } catch {
-        reject(new Error('invalid-json'))
-      }
-    })
-    req.on('error', reject)
-  })
 }
 
 /** The compact document behind the chip. */
