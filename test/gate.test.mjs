@@ -288,3 +288,61 @@ tools.push({ name: 'ppt_extra' })
 emit('tools/change')
 console.log('changed registry re-applies =', restrictCalls.length - beforeChange, restrictCalls.length > beforeChange ? 'OK' : 'FAIL (missed the new tool)')
 tools.pop()
+
+// Opening a conversation from history attaches no agent until something happens
+// in it, so the very first status read has no live agent to ask. The answer must
+// still name the toolset — otherwise the chip shows 未知档 until the user
+// switches away and back, which is the bug being guarded here.
+const routeCtx = makeCtx()
+const routes = []
+routeCtx.webServer = {
+  register: (entry) => {
+    routes.push(entry)
+    return () => {}
+  },
+}
+fs.writeFileSync(
+  path.join(home, 'state', 'mode-switch', 'catalog.json'),
+  JSON.stringify({
+    modes: [
+      { id: 'mode-basic', name: '基础档', order: 1, deny: ['ppt_*', 'mcp__solidworks__*'] },
+      { id: 'mode-full', name: '全量档', order: 2, deny: [] },
+    ],
+  }),
+  'utf8',
+)
+const bumped2 = new Date(Date.now() + 20000)
+fs.utimesSync(path.join(home, 'state', 'mode-switch', 'catalog.json'), bumped2, bumped2)
+apply(routeCtx)
+
+const statusHandler = routes.find((entry) => entry.path === '/api/mode-switch/status')?.handler
+if (typeof statusHandler !== 'function') {
+  console.log('status route = FAIL (not registered)')
+} else {
+  const read = (sessionId) =>
+    new Promise((resolve) => {
+      const req = { url: `http://localhost/api/mode-switch/status?sessionId=${encodeURIComponent(sessionId)}` }
+      const res = {
+        setHeader: () => {},
+        end: (body) => resolve(JSON.parse(body)),
+      }
+      statusHandler(req, res)
+    })
+
+  // A conversation that exists on disk but has no agent attached: full toolset.
+  fs.mkdirSync(path.join(home, 'sessions', 'ws-x', 'session-old-story'), { recursive: true })
+  fs.writeFileSync(path.join(home, 'sessions', 'ws-x', 'session-old-story', 'session.v4.jsonl.zstd'), '')
+  const old = await read('session-old-story')
+  console.log('stored session names a toolset =', old.toolset, old.session === 'stored' && old.toolset === 'mode-full' ? 'OK' : 'FAIL (would read as 未知档)')
+
+  // A trimmed conversation keeps its own mode even without a live agent.
+  const store2 = JSON.parse(fs.readFileSync(path.join(home, 'state', 'mode-switch', 'sessions.json'), 'utf8'))
+  store2['session-old-story'] = { mode: 'mode-basic', appliedAt: '2026-11-01T00:00:00.000Z' }
+  fs.writeFileSync(path.join(home, 'state', 'mode-switch', 'sessions.json'), JSON.stringify(store2, null, 2), 'utf8')
+  const trimmedRead = await read('session-old-story')
+  console.log('stored session keeps its mode =', trimmedRead.toolset, trimmedRead.toolset === 'mode-basic' ? 'OK' : 'FAIL')
+
+  // An id that is not a conversation at all stays unknown.
+  const ghost = await read('session-does-not-exist')
+  console.log('unknown session stays unknown =', ghost.session, ghost.session === 'unknown' ? 'OK' : 'FAIL')
+}

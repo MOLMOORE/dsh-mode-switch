@@ -1,6 +1,6 @@
 {
   "name": "dsh-mode-switch",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "private": true,
   "description": "Tool profiles for DeepSeek Harness: choose which tools a session carries, edit profiles and their tool sets in the panel.",
   "repository": {

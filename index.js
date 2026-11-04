@@ -18,7 +18,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { catalogPath, loadCatalog, matchesAny, normalizeModes } from './catalog.js'
-import { sessionEvidence } from './session-log.js'
+import { findSessionLog, sessionEvidence } from './session-log.js'
 import { suggestModes } from './auto.js'
 
 export { normalizeModes } from './catalog.js'
@@ -594,7 +594,7 @@ export function resolveModeId(catalog, wanted) {
 /** The compact document behind the chip. */
 function statusPayload(ctx, sessionId, catalog, live) {
   const agent = sessionId === undefined ? undefined : liveAgent(ctx, sessionId)
-  const toolsetId0 = displayedToolset(ctx, catalog, agent, live)
+  const toolsetId0 = displayedToolset(ctx, catalog, agent, live, sessionId)
   const toolset0 = catalog.modes.find((entry) => entry.id === toolsetId0)
   // Until the toolset is actually applied (first step), report what the chosen
   // toolset WOULD leave visible, so switching updates the number immediately.
@@ -607,7 +607,7 @@ function statusPayload(ctx, sessionId, catalog, live) {
     })
   }
   const schemaChars = JSON.stringify(schemas).length
-  const toolsetId = displayedToolset(ctx, catalog, agent, live)
+  const toolsetId = displayedToolset(ctx, catalog, agent, live, sessionId)
   const toolset = catalog.modes.find((entry) => entry.id === toolsetId)
   const presetId = officialPreset(ctx, agent)
   const applied = agent !== undefined && live.has(agent.id)
@@ -626,6 +626,11 @@ function statusPayload(ctx, sessionId, catalog, live) {
     ok: true,
     sessionId: sessionId ?? null,
     live: agent !== undefined,
+    // How the session was recognised: attached right now, merely present on
+    // disk, or not a conversation this host knows about. The chip needs the last
+    // case told apart from the middle one, or a conversation that is still
+    // opening reads as 未知档 instead of 读取中.
+    session: agent !== undefined ? 'live' : toolset === undefined ? 'unknown' : 'stored',
     nextSessionOnly: pendingToolset !== undefined,
     pendingToolset: pendingToolset === undefined ? undefined : catalog.modes.find((entry) => entry.id === pendingToolset)?.name,
     preset: presetId,
@@ -660,7 +665,7 @@ async function detailPayload(ctx, sessionId, catalog, live) {
     })
     .sort((a, b) => b.tokens - a.tokens || a.name.localeCompare(b.name))
   const chars = tools.reduce((sum, tool) => sum + tool.chars, 0)
-  const currentId = displayedToolset(ctx, catalog, agent, live)
+  const currentId = displayedToolset(ctx, catalog, agent, live, sessionId)
   const globals = globalSchemas(ctx)
   const applied = agent !== undefined && live.has(agent.id)
   const recorded = agent === undefined ? undefined : recordedToolset(agent.id)
@@ -737,10 +742,28 @@ function selectPayload(ctx, catalog, sessionId, toolsetId, applyToolset, live) {
   // The toolset is a pre-flight decision: once the session has started a turn
   // the tool catalog is assembled and cannot be widened, so the choice is closed.
   if (!sessionBlank(ctx, agent)) {
-    return { ok: false, reason: 'session-started', toolset: displayedToolset(ctx, catalog, agent, live) }
+    return { ok: false, reason: 'session-started', toolset: displayedToolset(ctx, catalog, agent, live, sessionId) }
   }
   writeSession(sessionId, toolsetId)
   return { ok: true, toolset: toolsetId, stored: true, applied: false }
+}
+
+/**
+ * The toolset a session carries when it has no live agent.
+ *
+ * Opening a conversation from history attaches nothing until something happens
+ * in it, yet the chip is read the instant the click lands — so `liveAgent()` is
+ * undefined for exactly the moment the label is needed. The session's own
+ * record answers it; with no record the conversation predates the plugin (or ran
+ * while it was disabled), which is the full toolset — the same rule a live agent
+ * with no trim gets. A session id with no log at all is not a conversation, so
+ * it stays unknown.
+ */
+function storedToolsetFor(sessionId, catalog) {
+  if (sessionId === undefined || sessionId === '') return undefined
+  const recorded = recordedToolset(sessionId)
+  if (recorded !== undefined && catalog.modes.some((entry) => entry.id === recorded)) return recorded
+  return findSessionLog(sessionId) === undefined ? undefined : 'mode-full'
 }
 
 /**
@@ -751,8 +774,8 @@ function selectPayload(ctx, catalog, sessionId, toolsetId, applyToolset, live) {
  * conversation that predates the plugin — is untrimmed and reads as the full
  * toolset, never as the default.
  */
-function displayedToolset(ctx, catalog, agent, live) {
-  if (agent === undefined) return undefined
+function displayedToolset(ctx, catalog, agent, live, sessionId) {
+  if (agent === undefined) return storedToolsetFor(sessionId, catalog)
   const applied = live.get(agent.id)?.toolset
   if (typeof applied === 'string' && catalog.modes.some((entry) => entry.id === applied)) return applied
   // The in-memory record is lost when the plugin reloads; the applied record on
