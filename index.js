@@ -323,6 +323,37 @@ export function apply(ctx) {
     return resolveModeId(catalog, typeof id === 'string' ? id : DEFAULT_TOOLSET)
   }
 
+  /**
+   * Sources that mean "this session already existed".
+   *
+   * `dsh-agent-loop` announces a session rebuilt from its log as `resume`;
+   * `clear` / `compaction` continue a session that was already running. None of
+   * them is a fresh conversation, so none of them may adopt the default toolset
+   * — see {@link mayTrimByDefault}.
+   */
+  const RESUMED_SOURCES = new Set(['resume', 'clear', 'compaction'])
+
+  /**
+   * Whether this agent may take the default toolset without being told to.
+   *
+   * A conversation that predates the plugin (or ran while it was disabled) has
+   * no record here. Trimming it at resume would both change the tool set it was
+   * created with and — because {@link recordApplied} then writes a record — make
+   * that change permanent, which is exactly how pre-plugin conversations ended
+   * up reading as 基础档. So the default applies only to a genuinely new, still
+   * blank conversation; everything already carrying history keeps what it has
+   * unless the user chose a toolset for it.
+   */
+  const mayTrimByDefault = (agent, source) => {
+    const stored = readSessions()[agent.id]
+    // An explicit preference (string) or an applied record (object) is a real
+    // decision — for this session, keep honouring it on every resume.
+    if (typeof stored === 'string') return true
+    if (stored !== null && typeof stored === 'object' && typeof stored.mode === 'string') return true
+    if (RESUMED_SOURCES.has(source)) return false
+    return sessionBlank(ctx, agent)
+  }
+
   /** Apply the stored-or-default toolset once, before the agent's first step. */
   const ensureToolset = (agent, position) => {
     if (live.has(agent.id)) return
@@ -332,6 +363,7 @@ export function apply(ctx) {
     // Gate on the step position instead — the first step of the first turn is
     // exactly the point before the session's first request is assembled.
     if (position?.turn !== 1 || position?.step !== 1) return
+    if (!mayTrimByDefault(agent)) return
     const chosen = toolsetFor(agent.id)
     if (applyToolset(agent, chosen)) recordApplied(agent.id, chosen)
     installPromptFilter(agent, chosen)
@@ -362,6 +394,7 @@ export function apply(ctx) {
       try {
         timed('created', () => {
           if (live.has(agent.id)) return
+          if (!mayTrimByDefault(agent, payload?.source)) return
           const chosen = toolsetFor(agent.id)
           if (applyToolset(agent, chosen)) recordApplied(agent.id, chosen)
           installPromptFilter(agent, chosen)
