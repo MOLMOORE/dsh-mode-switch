@@ -46,8 +46,16 @@ export function findSessionLog(sessionId, home = dshHome()) {
  * Only the first `maxBytes` are read: request headers sit at the head of a
  * session, and a runaway log must not block the host while the panel is open. A
  * frame cut by the byte cap simply fails to decode and is skipped.
+ *
+ * The cap is deliberately small. This runs on the host's single thread, so its
+ * cost is the user's UI: every byte read here is a byte the host cannot use to
+ * answer the window. 4 MiB still covers the largest session on this machine
+ * (2.6 MiB) whole, so the panel keeps every request; a log that outgrows the cap
+ * loses its tail, which is a reporting gap, not a hang.
  */
-export function readLogFrames(file, maxBytes = 32 * 1024 * 1024) {
+const HEAD_BYTES = 4 * 1024 * 1024
+
+export function readLogFrames(file, maxBytes = HEAD_BYTES) {
   const fd = fs.openSync(file, 'r')
   let buf
   try {
@@ -58,10 +66,10 @@ export function readLogFrames(file, maxBytes = 32 * 1024 * 1024) {
   } finally {
     fs.closeSync(fd)
   }
+  // `Buffer.indexOf` is the native memchr; a JS byte loop over megabytes burns
+  // the very thread this route is supposed to keep free.
   const starts = []
-  for (let i = 0; i <= buf.length - 4; i += 1) {
-    if (buf[i] === MAGIC[0] && buf[i + 1] === MAGIC[1] && buf[i + 2] === MAGIC[2] && buf[i + 3] === MAGIC[3]) starts.push(i)
-  }
+  for (let i = buf.indexOf(MAGIC, 0); i !== -1; i = buf.indexOf(MAGIC, i + 4)) starts.push(i)
   const parts = []
   for (let k = 0; k < starts.length; k += 1) {
     const from = starts[k]
@@ -69,11 +77,8 @@ export function readLogFrames(file, maxBytes = 32 * 1024 * 1024) {
     try {
       parts.push(zlib.zstdDecompressSync(buf.subarray(from, to)).toString('utf8'))
     } catch {
-      try {
-        parts.push(zlib.zstdDecompressSync(buf.subarray(from)).toString('utf8'))
-      } catch {
-        // A frame that will not decode is skipped rather than failing the read.
-      }
+      // A start marker that is really payload, or a frame cut by the byte cap:
+      // skip it rather than failing the whole read.
     }
   }
   return parts.join('')

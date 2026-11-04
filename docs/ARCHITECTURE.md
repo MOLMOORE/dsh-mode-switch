@@ -42,6 +42,18 @@ agent/created → setTimeout(0) → applyToolset(agent)       ← 唯一能到�
 agent/pre-step（turn 1 / step 1）→ 兜底（赶不上首个请求，见 LIMITATIONS）
 ```
 
+`applyToolset()` 有两个必须保留的约束，它们都是 0.4.3 卡死事故的产物：
+
+- **重入闸 `applying`**：宿主在 `restrict()` 内部**同步**发 `tools/change`
+  （`ScopedLayers.effect()` 末尾直接 `onChange()`，`Context.emit()` 同步调监听器），
+  disposer 也会发。而 `tools/change` 的回调会对已裁剪的 agent 再 `applyToolset()`，
+  所以没有闸就是「裁剪 → emit → 回调 → 再裁剪」的无界递归，每层还跑一次 `tools.schemas()`。
+  回归测试里单次事件能跑出 1482 层嵌套 `restrict()`，宿主主线程占死、界面全废且不崩溃。
+- **集合相同就不重复应用**：每次 `restrict()` 往作用域叠一层摘不掉的限制，
+  反复应用同样的规则会让后续每次 `schemas()` 越来越慢；比较的是 deny 集合，与顺序无关。
+- `dispose()` 必须发生在把该会话移出 `live` **之后**，否则 disposer 同步发的
+  `tools/change` 会让回调仍然认为这个会话需要重算。
+
 工具表定稿之后，插件再挂一层 `system-prompt/assemble` 瀑布（`{ prepend: true }`）：
 该档 `deny` 里形如 `<family>_*` 的规则同时去掉名为 `<family>` 的提示段
 （论衡就是靠这条从基础档消失的；它的卡片仍会显示，见 LIMITATIONS §7）。
