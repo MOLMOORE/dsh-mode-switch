@@ -177,7 +177,7 @@ export function apply(ctx) {
         async (_assembly, _context, next) => {
           const assembled = await next()
           try {
-            return trimPromptSections(assembled, families)
+            return timed('assemble-filter', () => trimPromptSections(assembled, families))
           } catch (error) {
             ctx.logger?.('mode-switch')?.warn?.(`prompt section filter skipped: ${error?.message ?? error}`)
             return assembled
@@ -190,6 +190,31 @@ export function apply(ctx) {
     } catch (error) {
       diag.lastError = String(error?.message ?? error)
       ctx.logger?.('mode-switch')?.warn?.(`prompt filter failed for ${toolset.id}: ${error?.message ?? error}`)
+    }
+  }
+
+  /**
+   * Run one hook body and record it when it takes suspiciously long.
+   *
+   * The host is single-threaded: a synchronous stall here freezes every request.
+   * Keeping the slowest entries in `diag` makes that visible after the fact
+   * instead of leaving a hang with no trace.
+   */
+  const timed = (label, fn) => {
+    const clock = typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? () => performance.now()
+      : () => Date.now()
+    const started = clock()
+    try {
+      return fn()
+    } finally {
+      const ms = Math.round(clock() - started)
+      if (ms >= 200) {
+        diag.slow = diag.slow ?? []
+        diag.slow.push({ label, ms, at: new Date().toISOString() })
+        if (diag.slow.length > 20) diag.slow.shift()
+        log(`slow ${label}: ${ms}ms`)
+      }
     }
   }
 
@@ -220,7 +245,7 @@ export function apply(ctx) {
 
   ctx.on('agent/pre-step', async (payload, next) => {
     try {
-      ensureToolset(payload.agent, payload)
+      timed('pre-step', () => ensureToolset(payload.agent, payload))
     } catch (error) {
       ctx.logger?.('mode-switch')?.warn?.(`toolset apply skipped: ${error?.message ?? error}`)
     }
@@ -241,10 +266,12 @@ export function apply(ctx) {
     // whole session creation.
     setTimeout(() => {
       try {
-        if (live.has(agent.id)) return
-        const chosen = toolsetFor(agent.id)
-        if (applyToolset(agent, chosen)) recordApplied(agent.id, chosen)
-        installPromptFilter(agent, chosen)
+        timed('created', () => {
+          if (live.has(agent.id)) return
+          const chosen = toolsetFor(agent.id)
+          if (applyToolset(agent, chosen)) recordApplied(agent.id, chosen)
+          installPromptFilter(agent, chosen)
+        })
       } catch (error) {
         ctx.logger?.('mode-switch')?.warn?.(`toolset apply at creation skipped: ${error?.message ?? error}`)
       }
