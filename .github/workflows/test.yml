@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  logic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Logic tests
+        run: node test/gate.test.mjs
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check catalog.js
+          node --check session-log.js
+          node --check auto.js
