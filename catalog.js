@@ -9,7 +9,7 @@ export const DEFAULT_CATALOG = {
       id: 'mode-basic',
       name: '基础档',
       order: 10,
-      deny: ['mcp__solidworks__*', 'ego_*', 'ppt_*', 'office_*', 'paper_*', 'zotero_*', 'lunheng_*'],
+      deny: ['mcp__*', 'ego_*', 'ppt_*', 'office_*', 'paper_*', 'zotero_*', 'lunheng_*'],
     },
     {
       id: 'mode-office',

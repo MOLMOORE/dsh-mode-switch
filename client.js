@@ -34,6 +34,23 @@ window.__ModuleLoader__.load({
       'panel.verify.first': '首个请求带 {n} 个工具 · 本档泄漏 {leaks}',
       'panel.verify.none': '还没有请求记录（发一条消息后再看）',
       'panel.verify.failed': '证据读取失败',
+      'panel.saved': '比全量档省下的 schema token',
+      'panel.edit': '编辑档位',
+      'panel.edit.done': '完成',
+      'panel.edit.add': '新建档位',
+      'panel.edit.delete': '删除该档',
+      'panel.edit.name': '名称',
+      'panel.edit.search': '搜索工具',
+      'panel.edit.save': '保存',
+      'panel.edit.cancel': '取消',
+      'panel.edit.saving': '保存中…',
+      'panel.edit.saved': '已保存，新会话生效',
+      'panel.edit.failed': '保存失败：',
+      'panel.edit.all': '全选',
+      'panel.edit.none': '全不选',
+      'panel.edit.count': '已选 {n}/{total} 个工具',
+      'panel.edit.last': '至少保留一个档位',
+      'panel.edit.title': '增删档位、改名、勾选该档包含的工具；改完保存，新会话按新规则裁剪',
       'panel.loading': '读取明细中…',
       'panel.error': '明细读取失败',
       'panel.empty': '无可见工具',
@@ -72,6 +89,23 @@ window.__ModuleLoader__.load({
       'panel.verify.first': 'first request carried {n} tools · leaks {leaks}',
       'panel.verify.none': 'No request yet — send a message, then look again',
       'panel.verify.failed': 'Could not read evidence',
+      'panel.saved': 'schema tokens saved vs. the full mode',
+      'panel.edit': 'Edit modes',
+      'panel.edit.done': 'Done',
+      'panel.edit.add': 'New mode',
+      'panel.edit.delete': 'Delete this mode',
+      'panel.edit.name': 'Name',
+      'panel.edit.search': 'Search tools',
+      'panel.edit.save': 'Save',
+      'panel.edit.cancel': 'Cancel',
+      'panel.edit.saving': 'Saving…',
+      'panel.edit.saved': 'Saved — applies to new sessions',
+      'panel.edit.failed': 'Save failed: ',
+      'panel.edit.all': 'All',
+      'panel.edit.none': 'None',
+      'panel.edit.count': '{n}/{total} tools selected',
+      'panel.edit.last': 'Keep at least one mode',
+      'panel.edit.title': 'Add or remove modes, rename them, and tick the tools each mode keeps; saving applies to new sessions',
       'panel.loading': 'Reading details…',
       'panel.error': 'Could not read details',
       'panel.empty': 'No visible tools',
@@ -286,6 +320,20 @@ window.__ModuleLoader__.load({
         h(
           'span',
           {
+            title: t('panel.saved'),
+            style: {
+              flex: '0 0 62px',
+              textAlign: 'right',
+              fontSize: 10.5,
+              color: 'var(--dsw-alias-state-success-primary)',
+              fontVariantNumeric: 'tabular-nums',
+            },
+          },
+          typeof mode.savedTokens === 'number' && mode.savedTokens > 0 ? `−${compact(mode.savedTokens)}` : '',
+        ),
+        h(
+          'span',
+          {
             style: {
               flex: '0 0 28px',
               textAlign: 'right',
@@ -294,6 +342,184 @@ window.__ModuleLoader__.load({
             },
           },
           mode.current ? t('panel.current') : '',
+        ),
+      )
+    }
+
+    const matchAny = (name, patterns) =>
+      (patterns ?? []).some((pattern) =>
+        typeof pattern === 'string' && pattern !== ''
+          ? pattern.endsWith('*')
+            ? name.startsWith(pattern.slice(0, -1))
+            : name === pattern
+          : false,
+      )
+
+    /**
+     * Rebuild one mode's deny list from the tools the user ticked.
+     *
+     * Wildcard rules are kept while they still exclude only unticked tools, so
+     * a hand-written rule such as `lunheng_*` survives editing; everything else
+     * becomes an exact name.
+     */
+    function buildDeny(mode, allNames, checked) {
+      const kept = (mode?.deny ?? []).filter(
+        (pattern) => !allNames.some((name) => checked.has(name) && matchAny(name, [pattern])),
+      )
+      const covered = (name) => matchAny(name, kept)
+      const extra = allNames.filter((name) => !checked.has(name) && !covered(name))
+      return [...kept, ...extra]
+    }
+
+    function Editor(props) {
+      const t = props.t
+      const draft = props.draft
+      const active = draft.find((mode) => mode.id === props.activeId) ?? draft[0]
+      const allTools = props.allTools
+      const checked = new Set(allTools.map((tool) => tool.name).filter((name) => !matchAny(name, active?.deny)))
+      const query = props.search.trim().toLowerCase()
+      const shown = (query === '' ? allTools : allTools.filter((tool) => tool.name.toLowerCase().includes(query))).slice(0, 400)
+
+      const field = {
+        boxSizing: 'border-box',
+        padding: '3px 7px',
+        border: '0.5px solid var(--dsw-alias-border-l1)',
+        borderRadius: 6,
+        background: 'var(--dsw-alias-bg-layer-1)',
+        color: 'var(--dsw-alias-label-primary)',
+        font: 'inherit',
+        fontSize: 11,
+      }
+      const button = {
+        ...field,
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+      }
+
+      return h(
+        React.Fragment,
+        null,
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } },
+          h('span', { style: { fontSize: 12, fontWeight: 650 } }, t('panel.edit')),
+          h('span', { style: { flex: '1 1 auto' } }),
+          h('button', { type: 'button', style: button, onClick: props.onDone }, t('panel.edit.done')),
+        ),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', paddingTop: 4 } },
+          draft.map((mode) =>
+            h(
+              'button',
+              {
+                key: mode.id,
+                type: 'button',
+                title: active?.id === mode.id ? t('pill.current') : mode.id,
+                onClick: () => props.onSelect(mode.id),
+                style: {
+                  ...button,
+                  borderColor: active?.id === mode.id ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l1)',
+                  color: active?.id === mode.id ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+                },
+              },
+              mode.name,
+            ),
+          ),
+          h('button', { type: 'button', style: button, onClick: props.onAdd }, `+ ${t('panel.edit.add')}`),
+        ),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, paddingTop: 6, flexWrap: 'wrap' } },
+          h('span', { style: { fontSize: 10.5, color: 'var(--dsw-alias-label-secondary)' } }, t('panel.edit.name')),
+          h('input', {
+            value: active?.name ?? '',
+            onChange: (event) => props.onRename(event.target.value),
+            style: { ...field, flex: '1 1 120px' },
+          }),
+          h(
+            'button',
+            {
+              type: 'button',
+              title: t('panel.edit.delete'),
+              disabled: draft.length <= 1,
+              onClick: props.onDelete,
+              style: { ...button, opacity: draft.length <= 1 ? 0.4 : 1 },
+            },
+            '×',
+          ),
+        ),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 6, paddingTop: 6, flexWrap: 'wrap' } },
+          h('input', {
+            value: props.search,
+            placeholder: t('panel.edit.search'),
+            onChange: (event) => props.onSearch(event.target.value),
+            style: { ...field, flex: '1 1 140px' },
+          }),
+          h('button', { type: 'button', style: button, onClick: () => props.onAll(true) }, t('panel.edit.all')),
+          h('button', { type: 'button', style: button, onClick: () => props.onAll(false) }, t('panel.edit.none')),
+          h(
+            'span',
+            { style: { fontSize: 10.5, color: 'var(--dsw-alias-label-secondary)' } },
+            t('panel.edit.count').replace('{n}', String(checked.size)).replace('{total}', String(allTools.length)),
+          ),
+        ),
+        h(
+          'div',
+          { style: { maxHeight: 200, overflow: 'auto', paddingTop: 4 } },
+          shown.map((tool) =>
+            h(
+              'label',
+              {
+                key: tool.name,
+                style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, lineHeight: '17px', cursor: 'pointer' },
+              },
+              h('input', {
+                type: 'checkbox',
+                checked: checked.has(tool.name),
+                onChange: () => props.onToggle(tool.name, checked),
+              }),
+              h('span', { style: { flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, tool.name),
+              h(
+                'span',
+                { style: { flex: '0 0 auto', fontSize: 10, color: 'var(--dsw-alias-label-secondary)' } },
+                compact(tool.tokens),
+              ),
+            ),
+          ),
+        ),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', gap: 8, paddingTop: 6, flexWrap: 'wrap' } },
+          h(
+            'button',
+            {
+              type: 'button',
+              disabled: props.saving,
+              onClick: props.onSave,
+              style: {
+                ...button,
+                padding: '3px 12px',
+                borderColor: 'var(--dsw-alias-brand-primary)',
+                color: 'var(--dsw-alias-label-primary)',
+                opacity: props.saving ? 0.5 : 1,
+              },
+            },
+            props.saving ? t('panel.edit.saving') : t('panel.edit.save'),
+          ),
+          h('button', { type: 'button', style: button, onClick: props.onCancel }, t('panel.edit.cancel')),
+          h(
+            'span',
+            {
+              style: {
+                fontSize: 10.5,
+                color: props.note?.kind === 'error' ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-success-primary)',
+              },
+            },
+            props.note?.text ?? '',
+          ),
         ),
       )
     }
@@ -373,8 +599,116 @@ window.__ModuleLoader__.load({
       const maxTokens = tools.length > 0 ? tools[0].tokens : 0
       const shown = tools.slice(0, props.limit)
       const rest = tools.length - shown.length
+      const allTools = phase === 'ready' && Array.isArray(data?.allTools) ? data.allTools : []
+      const [editing, setEditing] = React.useState(false)
+      const [draft, setDraft] = React.useState([])
+      const [activeId, setActiveId] = React.useState(undefined)
+      const [search, setSearch] = React.useState('')
+      const [saving, setSaving] = React.useState(false)
+      const [note, setNote] = React.useState(undefined)
 
-      return h(
+      const activeDraft = draft.find((mode) => mode.id === activeId) ?? draft[0]
+
+      const beginEdit = () => {
+        const next = modes.map((mode) => ({
+          id: mode.id,
+          name: mode.name ?? mode.id,
+          order: mode.order ?? 0,
+          deny: [...(mode.deny ?? [])],
+        }))
+        setDraft(next)
+        setActiveId(next.find((mode) => modes.find((m) => m.id === mode.id)?.current)?.id ?? next[0]?.id)
+        setEditing(true)
+        setNote(undefined)
+      }
+
+      const patchActive = (patch) => {
+        setDraft((previous) => previous.map((mode) => (mode.id === activeDraft?.id ? { ...mode, ...patch } : mode)))
+      }
+
+      const names = allTools.map((tool) => tool.name)
+
+      return editing
+        ? h(
+            'div',
+            {
+              id: props.id,
+              style: {
+                boxSizing: 'border-box',
+                width: '100%',
+                maxWidth: 760,
+                maxHeight: 460,
+                overflow: 'auto',
+                overscrollBehavior: 'contain',
+                padding: '8px 12px 10px',
+                border: '0.5px solid var(--dsw-alias-border-l1)',
+                borderRadius: 10,
+                background: 'var(--dsw-alias-bg-overlay)',
+                color: 'var(--dsw-alias-label-primary)',
+              },
+            },
+            h(Editor, {
+              t,
+              draft,
+              activeId,
+              search,
+              saving,
+              note,
+              allTools,
+              onSelect: setActiveId,
+              onAdd: () => {
+                const id = `mode-custom-${Date.now().toString(36)}`
+                const order = Math.max(0, ...draft.map((mode) => mode.order ?? 0)) + 10
+                setDraft((previous) => [...previous, { id, name: t('panel.edit.add'), order, deny: [] }])
+                setActiveId(id)
+              },
+              onDelete: () => {
+                if (draft.length <= 1) {
+                  setNote({ kind: 'error', text: t('panel.edit.last') })
+                  return
+                }
+                const remaining = draft.filter((mode) => mode.id !== activeDraft?.id)
+                setDraft(remaining)
+                setActiveId(remaining[0]?.id)
+              },
+              onRename: (value) => patchActive({ name: value }),
+              onToggle: (name, checked) => {
+                const next = new Set(checked)
+                if (next.has(name)) next.delete(name)
+                else next.add(name)
+                patchActive({ deny: buildDeny(activeDraft, names, next) })
+              },
+              onAll: (on) => patchActive({ deny: buildDeny(activeDraft, names, on ? new Set(names) : new Set()) }),
+              onSearch: setSearch,
+              onCancel: () => {
+                setEditing(false)
+                setNote(undefined)
+              },
+              onDone: () => {
+                setEditing(false)
+              },
+              onSave: async () => {
+                setSaving(true)
+                setNote(undefined)
+                try {
+                  const response = await fetch('/api/mode-switch/modes', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ modes: draft }),
+                  })
+                  const payload = await response.json().catch(() => undefined)
+                  if (!response.ok || payload?.ok !== true) throw new Error(payload?.reason ?? String(response.status))
+                  setNote({ kind: 'ok', text: t('panel.edit.saved') })
+                  props.onChanged?.()
+                } catch (error) {
+                  setNote({ kind: 'error', text: `${t('panel.edit.failed')}${error?.message ?? error}` })
+                } finally {
+                  setSaving(false)
+                }
+              },
+            }),
+          )
+        : h(
         'div',
         {
           id: props.id,
@@ -422,6 +756,28 @@ window.__ModuleLoader__.load({
                     t('panel.total')
                       .replace('{n}', String(data?.totals?.tools ?? 0))
                       .replace('{tok}', compact(data?.totals?.estimatedTokens ?? 0)),
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      title: t('panel.edit.title'),
+                      onClick: beginEdit,
+                      style: {
+                        boxSizing: 'border-box',
+                        margin: 0,
+                        padding: '2px 9px',
+                        borderRadius: 999,
+                        border: '0.5px solid var(--dsw-alias-border-l1)',
+                        background: 'transparent',
+                        color: 'var(--dsw-alias-label-secondary)',
+                        font: 'inherit',
+                        fontSize: 10.5,
+                        lineHeight: '15px',
+                        cursor: 'pointer',
+                      },
+                    },
+                    t('panel.edit'),
                   ),
                 ),
                 h(SectionLabel, null, t('panel.modes')),
@@ -652,7 +1008,7 @@ window.__ModuleLoader__.load({
         notice
           ? h('div', { style: { fontSize: 10.5, color: 'var(--dsw-alias-state-error-primary)' } }, notice)
           : null,
-        open ? h(Panel, { id: panelId, t, detail, verify, limit: 120 }) : null,
+        open ? h(Panel, { id: panelId, t, detail, verify, onChanged: () => setNonce((value) => value + 1), limit: 120 }) : null,
       )
     }
 

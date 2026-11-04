@@ -29,6 +29,7 @@ const STATUS_PATH = '/api/mode-switch/status'
 const DETAIL_PATH = '/api/mode-switch/detail'
 const SELECT_PATH = '/api/mode-switch/select'
 const VERIFY_PATH = '/api/mode-switch/verify'
+const MODES_PATH = '/api/mode-switch/modes'
 
 /** Rough token estimate: one token per four characters of the serialized schema. */
 const CHARS_PER_TOKEN = 4
@@ -59,6 +60,31 @@ export function apply(ctx) {
     return catalog
   }
 
+  /** Replace the whole mode list (add / rename / delete / pick tools), atomically. */
+  const saveModes = (body) => {
+    const normalized = normalizeModes(body?.modes)
+    if (normalized.error !== undefined) return { ok: false, reason: normalized.error }
+    const file = catalogPath()
+    const next = {
+      ...catalog,
+      version: catalog.version ?? 1,
+      modes: normalized.modes,
+      updatedAt: new Date().toISOString(),
+    }
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      const temp = `${file}.tmp`
+      fs.writeFileSync(temp, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+      fs.renameSync(temp, file)
+    } catch (error) {
+      return { ok: false, reason: `write-failed: ${error?.message ?? error}` }
+    }
+    catalog = next
+    catalog.diag = diag
+    diag.catalogSaves = (diag.catalogSaves ?? 0) + 1
+    return { ok: true, modes: catalog.modes.map(({ id, name, order, deny }) => ({ id, name, order, deny })) }
+  }
+
   // Session records outlive the sessions they point at (deleted sessions,
   // workspaces removed by hand). Drop those on load so the file stays a map of
   // real sessions rather than a growing log of every id ever seen.
@@ -69,7 +95,8 @@ export function apply(ctx) {
     refreshCatalog()
     const tools = ctx.get('tools')
     if (tools === undefined) return false
-    const toolset = catalog.modes.find((entry) => entry.id === toolsetId)
+    const id = resolveModeId(catalog, toolsetId)
+    const toolset = catalog.modes.find((entry) => entry.id === id)
     if (toolset === undefined) return false
     let globals
     try {
@@ -174,8 +201,7 @@ export function apply(ctx) {
     // A stored value is either the plain preference (string) or the applied
     // record written at the first step ({ mode, appliedAt }).
     const id = typeof stored === 'string' ? stored : stored !== null && typeof stored === 'object' ? stored.mode : undefined
-    if (typeof id === 'string' && catalog.modes.some((entry) => entry.id === id)) return id
-    return DEFAULT_TOOLSET
+    return resolveModeId(catalog, typeof id === 'string' ? id : DEFAULT_TOOLSET)
   }
 
   /** Apply the stored-or-default toolset once, before the agent's first step. */
@@ -254,6 +280,35 @@ export function apply(ctx) {
     () =>
       ctx.webServer.register({
         kind: 'exact',
+        path: MODES_PATH,
+        handler: async (req, res) => {
+          let status = 200
+          let payload
+          try {
+            if (req.method !== 'POST') {
+              status = 405
+              payload = { ok: false, reason: 'method-not-allowed' }
+            } else {
+              const body = await readJsonBody(req)
+              payload = saveModes(body)
+              if (payload.ok !== true) status = 400
+            }
+          } catch (error) {
+            status = 500
+            payload = { ok: false, reason: error instanceof Error ? error.message : String(error) }
+          }
+          res.statusCode = status
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.setHeader('cache-control', 'no-store')
+          res.end(JSON.stringify(payload))
+        },
+      }),
+    'mode-switch: modes route',
+  )
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
         path: SELECT_PATH,
         handler: async (req, res) => {
           let status = 200
@@ -317,6 +372,76 @@ function verifyPayload(ctx, sessionId, catalog, live) {
     first: evidence.first,
     recorded,
   }
+}
+
+/** The mode a session runs: its own choice when it still exists, else the first by order. */
+export function resolveModeId(catalog, wanted) {
+  const modes = Array.isArray(catalog?.modes) ? catalog.modes : []
+  if (modes.length === 0) return wanted ?? DEFAULT_TOOLSET
+  if (typeof wanted === 'string' && modes.some((entry) => entry.id === wanted)) return wanted
+  const first = [...modes].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))[0]
+  return first?.id ?? wanted ?? DEFAULT_TOOLSET
+}
+
+/**
+ * Validate one submitted mode list.
+ *
+ * The editor sends the complete list (adds, renames, deletions and tool picks),
+ * so this is the only place that decides what a writable catalog looks like:
+ * unique slug ids, a name, and deny patterns that are plain strings.
+ *
+ * @returns `{ modes }` on success, `{ error }` otherwise.
+ */
+export function normalizeModes(input) {
+  if (!Array.isArray(input)) return { error: 'modes must be an array' }
+  const seen = new Set()
+  const modes = []
+  for (const [index, raw] of input.entries()) {
+    const name = typeof raw?.name === 'string' ? raw.name.trim() : ''
+    if (name === '') return { error: `mode #${index + 1} needs a name` }
+    const wanted = typeof raw?.id === 'string' ? raw.id.trim() : ''
+    const id = wanted === '' ? `mode-custom-${index + 1}` : wanted
+    if (!/^[a-z0-9][a-z0-9_-]*$/i.test(id)) return { error: `invalid mode id: ${id}` }
+    if (seen.has(id)) return { error: `duplicate mode id: ${id}` }
+    seen.add(id)
+    const deny = Array.isArray(raw?.deny)
+      ? raw.deny
+          .filter((pattern) => typeof pattern === 'string' && pattern.trim() !== '')
+          .map((pattern) => pattern.trim())
+          .slice(0, 2000)
+      : []
+    const order = Number.isFinite(raw?.order) ? raw.order : (index + 1) * 10
+    modes.push({ id, name: name.slice(0, 40), order, deny })
+  }
+  if (modes.length === 0) return { error: 'at least one mode is required' }
+  return { modes }
+}
+
+/** Read a bounded JSON request body. */
+function readJsonBody(req, limit = 256 * 1024) {
+  return new Promise((resolve, reject) => {
+    let text = ''
+    req.setEncoding?.('utf8')
+    req.on('data', (chunk) => {
+      text += chunk
+      if (text.length > limit) {
+        reject(new Error('payload-too-large'))
+        req.destroy?.()
+      }
+    })
+    req.on('end', () => {
+      if (text === '') {
+        resolve({})
+        return
+      }
+      try {
+        resolve(JSON.parse(text))
+      } catch {
+        reject(new Error('invalid-json'))
+      }
+    })
+    req.on('error', reject)
+  })
 }
 
 /** The compact document behind the chip. */
@@ -397,6 +522,8 @@ async function detailPayload(ctx, sessionId, catalog, live) {
   // the preset/agent-scoped tools); a trimmed one can only be estimated from the
   // global registry, because its visible list can no longer be widened.
   const estimateBase = agent !== undefined && !trimmed ? schemas : globals
+  // Baseline for "how much does this mode save": every global tool visible.
+  const baseline = estimateToolset(estimateBase, { deny: [] })
   const toolsets = []
   for (const entry of [...catalog.modes].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))) {
     const current = entry.id === currentId
@@ -407,8 +534,24 @@ async function detailPayload(ctx, sessionId, catalog, live) {
     const footprint = measured
       ? { tools: tools.length, estimatedTokens: Math.round(chars / CHARS_PER_TOKEN), measured: true }
       : estimateToolset(estimateBase, entry)
-    toolsets.push({ id: entry.id, name: entry.name, deny: entry.deny ?? [], current, ...footprint })
+    toolsets.push({
+      id: entry.id,
+      name: entry.name,
+      order: entry.order ?? 0,
+      deny: entry.deny ?? [],
+      current,
+      ...footprint,
+      savedTokens: Math.max(0, baseline.estimatedTokens - footprint.estimatedTokens),
+    })
   }
+  // Editing needs the whole registry, not just what this session can see: a
+  // trimmed session can never widen again, but its catalog rules still can.
+  const allTools = globals
+    .map((schema) => ({
+      name: typeof schema.name === 'string' ? schema.name : '?',
+      tokens: Math.round(JSON.stringify(schema).length / CHARS_PER_TOKEN),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
   return {
     ok: true,
     sessionId: sessionId ?? null,
@@ -419,6 +562,8 @@ async function detailPayload(ctx, sessionId, catalog, live) {
     toolsetName: catalog.modes.find((entry) => entry.id === currentId)?.name,
     toolsets,
     tools,
+    allTools,
+    baseline,
     totals: { tools: tools.length, chars, estimatedTokens: Math.round(chars / CHARS_PER_TOKEN) },
   }
 }

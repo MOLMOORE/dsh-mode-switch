@@ -8,7 +8,7 @@ fs.rmSync(home, { recursive: true, force: true })
 fs.mkdirSync(home, { recursive: true })
 process.env.DSH_HOME = home
 
-const { apply, sectionFamilies, trimPromptSections, pruneSessions } = await import('../index.js')
+const { apply, sectionFamilies, trimPromptSections, pruneSessions, resolveModeId, normalizeModes } = await import('../index.js')
 const { loadCatalog } = await import('../catalog.js')
 const { requestEvidence } = await import('../session-log.js')
 
@@ -185,6 +185,24 @@ const afterPrune = JSON.parse(fs.readFileSync(sessionsFile, 'utf8'))
 console.log('prune removed =', pruned.removed, pruned.removed === 1 ? 'OK' : 'FAIL')
 console.log('prune kept live session =', afterPrune['session-keep'] !== undefined ? 'OK' : 'FAIL')
 console.log('prune kept foreign key =', afterPrune['not-a-session'] !== undefined ? 'OK' : 'FAIL')
+
+// Mode editing: the submitted list is the single writable surface, so ids,
+// names and deny patterns must be validated before anything is written.
+const accepted = normalizeModes([
+  { id: 'mode-work', name: ' 工作 ', order: 10, deny: ['a_*', '', 3] },
+  { id: 'mode-play', name: '玩', deny: ['b'] },
+])
+console.log('modes accepted =', accepted.error === undefined ? 'OK' : `FAIL (${accepted.error})`)
+console.log('mode name trimmed =', accepted.modes?.[0]?.name === '工作' ? 'OK' : 'FAIL')
+console.log('mode deny cleaned =', JSON.stringify(accepted.modes?.[0]?.deny) === '["a_*"]' ? 'OK' : 'FAIL')
+console.log('duplicate id rejected =', normalizeModes([{ id: 'x', name: 'X' }, { id: 'x', name: 'Y' }]).error !== undefined ? 'OK' : 'FAIL')
+console.log('empty name rejected =', normalizeModes([{ id: 'x', name: ' ' }]).error !== undefined ? 'OK' : 'FAIL')
+console.log('bad id rejected =', normalizeModes([{ id: 'no spaces', name: 'X' }]).error !== undefined ? 'OK' : 'FAIL')
+console.log('empty list rejected =', normalizeModes([]).error !== undefined ? 'OK' : 'FAIL')
+const fallback = resolveModeId({ modes: [{ id: 'mode-z', name: 'Z', order: 20 }, { id: 'mode-y', name: 'Y', order: 10 }] }, 'mode-deleted')
+console.log('deleted mode falls back to first by order =', fallback === 'mode-y' ? 'OK' : `FAIL (${fallback})`)
+console.log('existing mode kept =', resolveModeId({ modes: [{ id: 'mode-z', name: 'Z', order: 20 }] }, 'mode-z') === 'mode-z' ? 'OK' : 'FAIL')
+
 
 
 

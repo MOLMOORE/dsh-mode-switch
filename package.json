@@ -1,8 +1,16 @@
 {
   "name": "dsh-mode-switch",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "Per-session tool-set trimming for DeepSeek Harness: keep the official agent presets untouched and choose how many tools a session carries.",
+  "description": "Tool profiles for DeepSeek Harness: choose which tools a session carries, edit profiles and their tool sets in the panel.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MOLMOORE/dsh-mode-switch.git"
+  },
+  "homepage": "https://github.com/MOLMOORE/dsh-mode-switch#readme",
+  "bugs": {
+    "url": "https://github.com/MOLMOORE/dsh-mode-switch/issues"
+  },
   "type": "module",
   "icon": "./icon.svg",
   "exports": {
@@ -21,6 +29,7 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "README.en.md",
     "CHANGELOG.md",
     "LICENSE",
     "docs/*.md"
@@ -41,9 +50,13 @@
   "keywords": [
     "deepseek-harness",
     "dsh",
+    "dsh-plugin",
     "cordis",
+    "cordis-plugin",
     "tools",
+    "tool-permissions",
     "tokens",
+    "context-window",
     "preset"
   ],
   "scripts": {

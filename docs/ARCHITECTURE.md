@@ -28,6 +28,10 @@ client.js  ──GET /status──▶  index.js ──▶ tools.schemas(agent) /
 catalog 由 `catalog.js` 按 `mtime + size` 记忆读取，改了文件不用重启；
 插件加载时还会清理 `sessions.json` 里指向已不存在会话的条目。
 
+面板编辑器走 `POST /api/mode-switch/modes`：一次提交整个档位列表，服务端校验后写临时文件再 rename。
+前端的勾选状态换算成 `deny`——保留仍然只排除未勾选工具的通配规则（例如 `lunheng_*`），
+其余写成精确名字。这样既能用勾选框编辑，又不会把原来的通配规则一次改烂。
+
 `select` 只记录选择；真正应用发生在 `agent/created` 之后的一个 tick（早于首个请求的 `systemPrompt.assemble()`）：
 
 ```
