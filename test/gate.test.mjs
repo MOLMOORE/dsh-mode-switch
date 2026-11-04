@@ -219,3 +219,61 @@ console.log('existing mode kept =', resolveModeId({ modes: [{ id: 'mode-z', name
 
 
 
+
+// Re-entrancy: the host emits `tools/change` SYNCHRONOUSLY from inside
+// `restrict()` and from its disposer (`ScopedLayers.effect` ends with
+// `onChange()`; `Context.emit` runs listeners inline). Our own `tools/change`
+// handler re-applies the toolset to every agent this plugin trimmed, so without
+// a guard each trim re-enters that handler and recurses without bound — the
+// host's single thread stalls and the window dies with no crash report. This
+// drives that exact loop through a host-shaped fake.
+const recAgents = []
+const restrictCalls = []
+const recCtx = makeCtx()
+recCtx.get = (name) => {
+  if (name === 'tools') return { schemas: () => tools }
+  if (name === 'agents') return { list: () => recAgents }
+  return undefined
+}
+const emit = (name, payload) => {
+  for (const fn of recCtx.handlers.get(name) ?? []) fn(payload)
+}
+const recAgent = {
+  id: 'session-reentrant',
+  session: {},
+  ctx: {
+    tools: {
+      restrict({ deny }) {
+        restrictCalls.push(deny)
+        emit('tools/change')
+        return () => {
+          emit('tools/change')
+        }
+      },
+    },
+    on: () => () => {},
+  },
+}
+recAgents.push(recAgent)
+// Earlier blocks left a deny-free catalog behind; this test needs a toolset that
+// actually trims, otherwise no restrict() ever runs and the loop goes untested.
+fs.writeFileSync(
+  catalogFile,
+  JSON.stringify({ modes: [{ id: 'mode-basic', name: 'Basic', order: 1, deny: ['ppt_*', 'mcp__solidworks__*'] }] }),
+  'utf8',
+)
+const bumped = new Date(Date.now() + 10000)
+fs.utimesSync(catalogFile, bumped, bumped)
+apply(recCtx)
+recCtx.handlers.get('agent/created')[0]({ agent: recAgent, source: 'fresh' })
+await new Promise((resolve) => setTimeout(resolve, 30))
+console.log('re-entrant trim calls =', restrictCalls.length, restrictCalls.length <= 2 ? 'OK (bounded)' : 'FAIL (unbounded re-entry)')
+
+const beforeChange = restrictCalls.length
+emit('tools/change')
+console.log('same registry re-applies =', restrictCalls.length - beforeChange, restrictCalls.length === beforeChange ? 'OK (no-op)' : 'FAIL (churned a layer)')
+
+tools.push({ name: 'ppt_extra' })
+emit('tools/change')
+console.log('changed registry re-applies =', restrictCalls.length - beforeChange, restrictCalls.length > beforeChange ? 'OK' : 'FAIL (missed the new tool)')
+tools.pop()

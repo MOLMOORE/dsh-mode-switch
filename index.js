@@ -52,28 +52,60 @@ export function apply(ctx) {
   /** Per-plugin state directory, next to catalog.json. */
   const stateDir = () => path.dirname(catalogPath())
 
+  /** Bumped when a route handler runs: `req.socket.localPort` is the live port. */
+  let observedPort
+
   /**
-   * Heartbeat: rewrite one tiny file every 5s.
+   * Record one suspiciously long operation.
+   *
+   * The host is single-threaded: a synchronous stall freezes every request.
+   * Keeping the slowest entries in `diag` makes that visible while the process
+   * is alive, and appending to `slow.log` makes it visible after a restart.
+   */
+  const noteSlow = (label, ms) => {
+    diag.slow = diag.slow ?? []
+    diag.slow.push({ label, ms, at: new Date().toISOString() })
+    if (diag.slow.length > 20) diag.slow.shift()
+    log(`slow ${label}: ${ms}ms`)
+    try {
+      fs.appendFileSync(path.join(stateDir(), 'slow.log'), `${new Date().toISOString()} ${label} ${ms}ms\n`, 'utf8')
+    } catch {
+      // The in-memory copy still reaches the status route.
+    }
+  }
+
+  /**
+   * Heartbeat: rewrite one tiny file every 5s, and measure how late it is.
    *
    * The host is single-threaded, so a frozen UI usually means the loop stopped
    * turning. `diag` lives in memory and dies with the process, so a freeze
    * leaves nothing behind. The heartbeat's mtime marks the last healthy moment,
    * which survives a restart and makes the gap measurable.
+   *
+   * The gap alone cannot tell a stalled loop from a missing one, though, and it
+   * is only readable while the file is not being rewritten. So each beat also
+   * carries its own lateness (`lag`): a timer that fires 12s after a 5s deadline
+   * is proof the loop was blocked, written down at the moment it recovered.
+   * Anything late enough to matter also goes to `slow.log` as `event-loop-lag`.
    */
+  const BEAT_MS = 5000
   try {
-    const beat = () => {
+    let due = Date.now() + BEAT_MS
+    const beat = (first) => {
+      const at = Date.now()
+      const lag = first ? 0 : Math.max(0, at - due)
+      due = at + BEAT_MS
       try {
-        fs.writeFileSync(
-          path.join(stateDir(), 'heartbeat.json'),
-          `${JSON.stringify({ at: new Date().toISOString(), pid: process.pid })}\n`,
-          'utf8',
-        )
+        const record = { at: new Date(at).toISOString(), pid: process.pid, every: BEAT_MS, lag }
+        if (observedPort !== undefined) record.port = observedPort
+        fs.writeFileSync(path.join(stateDir(), 'heartbeat.json'), `${JSON.stringify(record)}\n`, 'utf8')
       } catch {
         // A heartbeat that cannot be written is not worth a crash.
       }
+      if (lag >= 1000) noteSlow('event-loop-lag', lag)
     }
-    beat()
-    const timer = setInterval(beat, 5000)
+    beat(true)
+    const timer = setInterval(() => beat(false), BEAT_MS)
     timer.unref?.()
   } catch {
     // Older hosts without a writable state dir simply skip the heartbeat.
@@ -125,8 +157,30 @@ export function apply(ctx) {
   // real sessions rather than a growing log of every id ever seen.
   diag.prunedSessions = pruneSessions()
 
+  /**
+   * Re-entrancy guard for {@link applyToolset}.
+   *
+   * The host emits `tools/change` SYNCHRONOUSLY from inside `restrict()` (and
+   * from its disposer): `layers.effect()` ends with `onChange()`, which is what
+   * emits the event. Our `tools/change` handler re-applies the toolset to every
+   * agent this plugin already trimmed, so without this flag every trim re-enters
+   * that handler, trims again, and re-enters again — unbounded synchronous
+   * recursion, each level paying a full `tools.schemas()`. That stalls the
+   * host's only thread and the UI dies without crashing.
+   */
+  let applying = false
+
+  /** Same tool names, order-independent. */
+  const sameNames = (left, right) => {
+    if (left.length !== right.length) return false
+    const sortedLeft = [...left].sort()
+    const sortedRight = [...right].sort()
+    return sortedLeft.every((name, index) => name === sortedRight[index])
+  }
+
   /** Apply one toolset to one agent, replacing whatever it carried before. */
   const applyToolset = (agent, toolsetId) => {
+    if (applying) return false
     refreshCatalog()
     const tools = ctx.get('tools')
     if (tools === undefined) return false
@@ -144,23 +198,31 @@ export function apply(ctx) {
       .filter((toolName) => toolName !== '' && matchesAny(toolName, toolset.deny ?? []))
 
     const previous = live.get(agent.id)
-    let disposeNote = 'none'
-    if (previous !== undefined) {
-      try {
-        previous.dispose?.()
-        disposeNote = 'ok'
-      } catch (error) {
-        disposeNote = `fail:${error?.message ?? error}`
-      }
-    }
-    live.delete(agent.id)
-    if (drop.length === 0) {
-      diag.applied.push({ sessionId: agent.id, toolset: toolset.id, dropped: 0, at: new Date().toISOString() })
-      return true
-    }
+    // Already trimming exactly these tools: nothing to re-apply. Each restrict
+    // adds a layer that cannot be lifted again, so repeating it for no gain
+    // makes every later `schemas()` call slower.
+    if (previous !== undefined && sameNames(previous.deny ?? [], drop)) return true
+
+    applying = true
     try {
+      // Drop the live record BEFORE disposing. The disposer emits
+      // `tools/change` synchronously, and the handler re-applies to every agent
+      // still in `live` — leaving this one there is the second way to re-enter.
+      live.delete(agent.id)
+      if (previous !== undefined) {
+        try {
+          previous.dispose?.()
+        } catch {
+          // A disposer that already ran is not an error.
+        }
+      }
+      if (drop.length === 0) {
+        diag.applied.push({ sessionId: agent.id, toolset: toolset.id, dropped: 0, at: new Date().toISOString() })
+        if (diag.applied.length > 20) diag.applied.shift()
+        return true
+      }
       const dispose = agent.ctx.tools.restrict({ deny: drop })
-      live.set(agent.id, { dispose, toolset: toolset.id })
+      live.set(agent.id, { dispose, toolset: toolset.id, deny: drop })
       diag.applied.push({ sessionId: agent.id, toolset: toolset.id, dropped: drop.length, at: new Date().toISOString() })
       if (diag.applied.length > 20) diag.applied.shift()
       return true
@@ -168,6 +230,8 @@ export function apply(ctx) {
       diag.lastError = String(error?.message ?? error)
       ctx.logger?.('mode-switch')?.warn?.(`restrict failed for ${toolset.id}: ${error?.message ?? error}`)
       return false
+    } finally {
+      applying = false
     }
   }
 
@@ -244,21 +308,7 @@ export function apply(ctx) {
       return fn()
     } finally {
       const ms = Math.round(clock() - started)
-      if (ms >= 200) {
-        diag.slow = diag.slow ?? []
-        diag.slow.push({ label, ms, at: new Date().toISOString() })
-        if (diag.slow.length > 20) diag.slow.shift()
-        log(`slow ${label}: ${ms}ms`)
-        try {
-          fs.appendFileSync(
-            path.join(stateDir(), 'slow.log'),
-            `${new Date().toISOString()} ${label} ${ms}ms\n`,
-            'utf8',
-          )
-        } catch {
-          // The in-memory copy still reaches the status route.
-        }
-      }
+      if (ms >= 200) noteSlow(label, ms)
     }
   }
 
@@ -335,16 +385,28 @@ export function apply(ctx) {
     }
   })
 
+  /**
+   * Remember which port the host listens on.
+   *
+   * No host API exposes it, but every request carries it: `req.socket.localPort`
+   * is the port this very handler was reached on. Recording it in the heartbeat
+   * is what lets an outside watcher find a restarted host without guessing.
+   */
+  const withPort = (handler) => (req, res) => {
+    if (observedPort === undefined) observedPort = req.socket?.localPort
+    return handler(req, res)
+  }
+
   ctx.effect(
-    () => ctx.webServer.register({ kind: 'exact', path: STATUS_PATH, handler: route(ctx, statusPayload, refreshCatalog, live) }),
+    () => ctx.webServer.register({ kind: 'exact', path: STATUS_PATH, handler: withPort(route(ctx, statusPayload, refreshCatalog, live)) }),
     'mode-switch: status route',
   )
   ctx.effect(
-    () => ctx.webServer.register({ kind: 'exact', path: DETAIL_PATH, handler: route(ctx, detailPayload, refreshCatalog, live) }),
+    () => ctx.webServer.register({ kind: 'exact', path: DETAIL_PATH, handler: withPort(route(ctx, detailPayload, refreshCatalog, live)) }),
     'mode-switch: detail route',
   )
   ctx.effect(
-    () => ctx.webServer.register({ kind: 'exact', path: VERIFY_PATH, handler: route(ctx, verifyPayload, refreshCatalog, live) }),
+    () => ctx.webServer.register({ kind: 'exact', path: VERIFY_PATH, handler: withPort(route(ctx, verifyPayload, refreshCatalog, live)) }),
     'mode-switch: verify route',
   )
   ctx.effect(
