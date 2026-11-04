@@ -1,0 +1,4 @@
+node_modules/
+.gate-home/
+*.log
+*.bak

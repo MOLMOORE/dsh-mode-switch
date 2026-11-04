@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "档位开关",
+    "description": "在输入框上方显示当前 agent preset、可见工具数与工具 schema 的 token 估算。"
+  }
+}

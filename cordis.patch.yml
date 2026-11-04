@@ -1,0 +1,8 @@
+# dsh-mode-switch — one plugin row only.
+#
+# The four official presets (standard / ptc / minimal / cordis) stay untouched:
+# this plugin never declares presets and never changes the registry default.
+# It only trims which tools a session sees, chosen independently of the preset.
+- insert:
+    - id: mode-switch
+      name: dsh-mode-switch

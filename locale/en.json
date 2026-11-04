@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Mode Switch",
+    "description": "Shows the current agent preset, the visible tool count and the estimated tool-schema tokens above the composer."
+  }
+}
