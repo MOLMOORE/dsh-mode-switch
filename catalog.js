@@ -32,21 +32,33 @@ export function catalogPath() {
   return path.join(home, 'state', 'mode-switch', 'catalog.json')
 }
 
+/**
+ * Last successful parse, keyed by `mtime + size`. The catalog is user-editable,
+ * so a change must be picked up without restarting DSH; an unreadable or
+ * half-written file keeps serving the last good copy instead of resetting every
+ * session to the built-in defaults.
+ */
+let cached = { key: undefined, value: undefined }
+
 /** Read the catalog, creating it from the built-in defaults on first run. */
 export function loadCatalog(log) {
+  const file = catalogPath()
   try {
-    const file = catalogPath()
     if (!fs.existsSync(file)) {
       fs.mkdirSync(path.dirname(file), { recursive: true })
       fs.writeFileSync(file, `${JSON.stringify(DEFAULT_CATALOG, null, 2)}\n`, 'utf8')
-      return DEFAULT_CATALOG
+      cached = { key: undefined, value: undefined }
     }
+    const stat = fs.statSync(file)
+    const key = `${file}|${stat.mtimeMs}|${stat.size}`
+    if (cached.key === key && cached.value !== undefined) return cached.value
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
-    if (!Array.isArray(parsed?.modes) || parsed.modes.length === 0) return DEFAULT_CATALOG
+    if (!Array.isArray(parsed?.modes) || parsed.modes.length === 0) return cached.value ?? { ...DEFAULT_CATALOG }
+    cached = { key, value: parsed }
     return parsed
   } catch (error) {
-    log?.(`catalog unreadable, using defaults: ${error?.message ?? error}`)
-    return DEFAULT_CATALOG
+    log?.(`catalog unreadable, keeping the last good copy: ${error?.message ?? error}`)
+    return cached.value ?? { ...DEFAULT_CATALOG }
   }
 }
 

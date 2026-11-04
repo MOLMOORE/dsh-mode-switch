@@ -66,7 +66,7 @@ plugin_manager install_bundle {"target": "<绝对路径>/dsh-mode-switch"}
 ```
 
 - `deny` 是**工具名规则**，不是包名：`前缀*` 匹配前缀，其它精确匹配
-- 改完重启 DSH 生效
+- 改完**不用重启**：插件按文件 mtime 重读（半写坏的文件会继续用上一份好副本），下一次 status/detail/select 或下一个会话生效
 - 加档位：加一条 `modes` 条目即可；`id` 建议保持 `mode-` 前缀
 - 改名：改 `name`（chip 和胶囊会跟着变）
 
@@ -80,15 +80,17 @@ plugin_manager install_bundle {"target": "<绝对路径>/dsh-mode-switch"}
 |---|---|---|
 | GET | `/api/mode-switch/status?sessionId=` | chip 用的紧凑数据：档位、工具数、是否已固定 |
 | GET | `/api/mode-switch/detail?sessionId=` | 面板数据：各档位估算 + 逐工具开销 |
+| GET | `/api/mode-switch/verify?sessionId=` | 请求级证据：会话日志里每个 `request/header` 真实携带的工具数与各档泄漏数 |
 | POST | `/api/mode-switch/select?sessionId=&toolset=` | 选择档位（仅未开始的会话） |
 
 ## 开发
 
 ```
 dsh-mode-switch/
-├── index.js        Host 半：档位应用、三条路由
-├── client.js       Client 半：composer 上方的 chip 与胶囊
-├── catalog.js      档位规则的读取与匹配
+├── index.js        Host 半：档位应用、提示段过滤、四条路由
+├── client.js       Client 半：composer 上方的 chip、胶囊与明细面板
+├── catalog.js      档位规则的读取与匹配（按 mtime 热重载）
+├── session-log.js  会话日志解码与请求级证据（verify 路由与 CLI 共用）
 ├── cordis.patch.yml 只注册一行插件，不声明任何 preset
 ├── locale/{en,zh}.json
 └── docs/

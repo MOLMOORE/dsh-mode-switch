@@ -2,11 +2,12 @@
  * dsh-mode-switch — Client half.
  *
  * One entry in `conversation.input.dock` (the shipped seat documented as
- * "Full-width entries above the composer card"): a read-only capsule showing the
- * session mode, the visible tool count and the estimated tool-schema tokens.
- * Clicking expands a read-only panel with every mode's footprint and the cost of
- * each visible tool. Nothing here switches a mode — the mode is a preset, chosen
- * when the session is created.
+ * "Full-width entries above the composer card"): a capsule showing the session
+ * mode, the visible tool count and the estimated tool-schema tokens. Clicking
+ * expands a panel with every mode's footprint, the cost of each visible tool,
+ * and the request-level evidence (what the first request really carried).
+ * The quick pills switch a still-blank session's mode; a started session is
+ * locked by design (the harness fixes the tool catalog on first assembly).
  */
 
 window.__ModuleLoader__.load({
@@ -29,6 +30,10 @@ window.__ModuleLoader__.load({
       'chip.applied': '已应用',
       'panel.modes': '档位',
       'panel.tools': '工具 schema 明细',
+      'panel.verify': '请求证据',
+      'panel.verify.first': '首个请求带 {n} 个工具 · 本档泄漏 {leaks}',
+      'panel.verify.none': '还没有请求记录（发一条消息后再看）',
+      'panel.verify.failed': '证据读取失败',
       'panel.loading': '读取明细中…',
       'panel.error': '明细读取失败',
       'panel.empty': '无可见工具',
@@ -63,6 +68,10 @@ window.__ModuleLoader__.load({
       'chip.applied': 'applied',
       'panel.modes': 'Modes',
       'panel.tools': 'Tool schema cost',
+      'panel.verify': 'Request evidence',
+      'panel.verify.first': 'first request carried {n} tools · leaks {leaks}',
+      'panel.verify.none': 'No request yet — send a message, then look again',
+      'panel.verify.failed': 'Could not read evidence',
       'panel.loading': 'Reading details…',
       'panel.error': 'Could not read details',
       'panel.empty': 'No visible tools',
@@ -163,6 +172,38 @@ window.__ModuleLoader__.load({
         }
       }, [open, sessionId, nonce])
       return state
+    }
+
+    /** Request-level evidence, read from the session log on the host. */
+    function useVerify(sessionId, open, nonce) {
+      const [state, setState] = React.useState({ phase: 'idle', data: undefined })
+      React.useEffect(() => {
+        if (!open || !sessionId) return undefined
+        let cancelled = false
+        setState({ phase: 'loading', data: undefined })
+        fetch(endpoint('/api/mode-switch/verify', sessionId), { cache: 'no-store' })
+          .then((response) => (response.ok ? response.json() : Promise.reject(new Error(String(response.status)))))
+          .then((data) => {
+            if (!cancelled) setState({ phase: 'ready', data })
+          })
+          .catch(() => {
+            if (!cancelled) setState({ phase: 'error', data: undefined })
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [open, sessionId, nonce])
+      return state
+    }
+
+    /** One line describing the session's first request against the current mode. */
+    function verifyLine(t, verify, toolsetId) {
+      if (verify === undefined || verify.phase === 'idle' || verify.phase === 'loading') return t('panel.loading')
+      if (verify.phase === 'error') return t('panel.verify.failed')
+      const first = verify.data?.first
+      if (first === undefined) return t('panel.verify.none')
+      const leaks = first.leaks?.[toolsetId] ?? '?'
+      return t('panel.verify.first').replace('{n}', String(first.tools)).replace('{leaks}', String(leaks))
     }
 
     function Sep() {
@@ -385,6 +426,12 @@ window.__ModuleLoader__.load({
                 ),
                 h(SectionLabel, null, t('panel.modes')),
                 modes.map((mode) => h(ModeRow, { key: mode.id, mode, t })),
+                h(SectionLabel, null, t('panel.verify')),
+                h(
+                  'div',
+                  { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } },
+                  verifyLine(t, props.verify, data?.toolset),
+                ),
                 h(
                   'div',
                   { style: { fontSize: 10.5, color: 'var(--dsw-alias-label-secondary)', paddingTop: 2 } },
@@ -461,6 +508,7 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState(undefined)
       const { phase, data } = useStatus(props.sessionId, nonce)
       const detail = useDetail(props.sessionId, open, nonce)
+      const verify = useVerify(props.sessionId, open, nonce)
       const title = t('chip.title')
       const panelId = `mode-switch-panel-${props.sessionId ?? 'none'}`
 
@@ -604,7 +652,7 @@ window.__ModuleLoader__.load({
         notice
           ? h('div', { style: { fontSize: 10.5, color: 'var(--dsw-alias-state-error-primary)' } }, notice)
           : null,
-        open ? h(Panel, { id: panelId, t, detail, limit: 120 }) : null,
+        open ? h(Panel, { id: panelId, t, detail, verify, limit: 120 }) : null,
       )
     }
 

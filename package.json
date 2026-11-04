@@ -1,6 +1,6 @@
 {
   "name": "dsh-mode-switch",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "description": "Per-session tool-set trimming for DeepSeek Harness: keep the official agent presets untouched and choose how many tools a session carries.",
   "type": "module",
@@ -16,6 +16,7 @@
     "index.js",
     "client.js",
     "catalog.js",
+    "session-log.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",

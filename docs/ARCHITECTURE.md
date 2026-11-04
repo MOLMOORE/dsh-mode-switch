@@ -18,8 +18,15 @@
 client.js  ──GET /status──▶  index.js ──▶ tools.schemas(agent) / sessions.json
     │                            │
     ├──GET /detail───────────────┤
+    ├──GET /verify───────────────┤──▶ session-log.js ──▶ sessions/<ws>/<id>/session.v4.jsonl.zstd
     └──POST /select──────────────┘  → sessions.json（仅未开始的会话）
 ```
+
+`/verify` 是唯一读**真实请求**的入口：它解压会话日志（多帧 zstd），取每个
+`request/header` 的工具名再按各档 `deny` 记泄漏数。其余两个接口看的是注册表现状。
+
+catalog 由 `catalog.js` 按 `mtime + size` 记忆读取，改了文件不用重启；
+插件加载时还会清理 `sessions.json` 里指向已不存在会话的条目。
 
 `select` 只记录选择；真正应用发生在 `agent/created` 之后的一个 tick（早于首个请求的 `systemPrompt.assemble()`）：
 
@@ -41,9 +48,10 @@ agent/pre-step（turn 1 / step 1）→ 兜底（赶不上首个请求，见 LIMI
 
 | 文件 | 职责 |
 |---|---|
-| `index.js` | 应用档位、三条路由、会话选择持久化 |
-| `client.js` | chip、快速选择胶囊、明细面板 |
-| `catalog.js` | 档位规则读取、`前缀*` 匹配 |
+| `index.js` | 应用档位、四条路由、会话选择持久化与清理 |
+| `client.js` | chip、快速选择胶囊、明细面板（含请求证据行） |
+| `catalog.js` | 档位规则读取（mtime 热重载）、`前缀*` 匹配 |
+| `session-log.js` | 会话日志解码、`request/header` 证据解析（路由与 CLI 共用） |
 | `cordis.patch.yml` | 只注册一行插件 |
 
 ## 事件

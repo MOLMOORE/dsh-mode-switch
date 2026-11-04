@@ -8,7 +8,9 @@ fs.rmSync(home, { recursive: true, force: true })
 fs.mkdirSync(home, { recursive: true })
 process.env.DSH_HOME = home
 
-const { apply, sectionFamilies, trimPromptSections } = await import('../index.js')
+const { apply, sectionFamilies, trimPromptSections, pruneSessions } = await import('../index.js')
+const { loadCatalog } = await import('../catalog.js')
+const { requestEvidence } = await import('../session-log.js')
 
 const tools = [
   { name: 'mcp__solidworks__solidworks_connect' },
@@ -138,5 +140,51 @@ if (filter !== undefined) {
   console.log('filter output sections =', filtered.sections.map((section) => section.name).join(','),
     filtered.sections.length === 1 && filtered.sections[0].name === 'base' ? 'OK' : 'FAIL')
 }
+
+// Request evidence: the verify route reads `request/header` events, so the
+// parser must count real tool names and score them against each mode's deny.
+const evidenceText = [
+  JSON.stringify({ type: 'request/header', seq: 16, data: { header: { tools: [{ name: 'a' }, { name: 'lunheng_x' }, { name: 'b' }] } } }),
+  JSON.stringify({ type: 'message', seq: 17, data: {} }),
+  JSON.stringify({ type: 'request/header', seq: 40, data: { header: { tools: [{ name: 'a' }, { name: 'b' }] } } }),
+  JSON.stringify({ type: 'request/header', seq: 41, data: { header: { tools: ['a'] } } }),
+].join('\n')
+const rows = requestEvidence(evidenceText, [{ id: 'mode-basic', deny: ['lunheng_*'] }])
+console.log('evidence rows =', rows.length, rows.length === 3 ? 'OK' : 'FAIL')
+console.log('evidence first tools =', rows[0]?.tools, rows[0]?.tools === 3 ? 'OK' : 'FAIL')
+console.log('evidence first leaks =', rows[0]?.leaks['mode-basic'], rows[0]?.leaks['mode-basic'] === 1 ? 'OK' : 'FAIL')
+console.log('evidence string tools =', rows[2]?.tools, rows[2]?.tools === 1 ? 'OK' : 'FAIL')
+
+// Catalog hot reload: editing the user catalog must take effect without a
+// restart, and a half-written file must keep the last good copy.
+const catalogFile = path.join(home, 'state', 'mode-switch', 'catalog.json')
+fs.mkdirSync(path.dirname(catalogFile), { recursive: true })
+fs.writeFileSync(catalogFile, JSON.stringify({ modes: [{ id: 'mode-a', name: 'A', order: 1, deny: [] }] }), 'utf8')
+const firstLoad = loadCatalog()
+console.log('catalog first read =', firstLoad.modes[0]?.id, firstLoad.modes[0]?.id === 'mode-a' ? 'OK' : 'FAIL')
+fs.writeFileSync(catalogFile, JSON.stringify({ modes: [{ id: 'mode-b', name: 'B', order: 1, deny: [] }] }), 'utf8')
+const future = new Date(Date.now() + 5000)
+fs.utimesSync(catalogFile, future, future)
+const secondLoad = loadCatalog()
+console.log('catalog reloaded =', secondLoad.modes[0]?.id, secondLoad.modes[0]?.id === 'mode-b' ? 'OK' : 'FAIL')
+fs.writeFileSync(catalogFile, '{ broken', 'utf8')
+const afterBroken = loadCatalog()
+console.log('catalog keeps last good copy =', afterBroken.modes[0]?.id === 'mode-b' ? 'OK' : 'FAIL')
+
+// Session records: entries for sessions whose directory is gone must be pruned,
+// and the write must leave the surviving entries intact.
+const sessionsFile = path.join(home, 'state', 'mode-switch', 'sessions.json')
+fs.mkdirSync(path.join(home, 'sessions', 'workspace-x', 'session-keep'), { recursive: true })
+fs.writeFileSync(sessionsFile, JSON.stringify({
+  'session-keep': { mode: 'mode-basic', appliedAt: '2026-11-01T00:00:00.000Z' },
+  'session-gone': { mode: 'mode-office', appliedAt: '2026-11-01T00:00:00.000Z' },
+  'not-a-session': 'mode-full',
+}, null, 2), 'utf8')
+const pruned = pruneSessions()
+const afterPrune = JSON.parse(fs.readFileSync(sessionsFile, 'utf8'))
+console.log('prune removed =', pruned.removed, pruned.removed === 1 ? 'OK' : 'FAIL')
+console.log('prune kept live session =', afterPrune['session-keep'] !== undefined ? 'OK' : 'FAIL')
+console.log('prune kept foreign key =', afterPrune['not-a-session'] !== undefined ? 'OK' : 'FAIL')
+
 
 

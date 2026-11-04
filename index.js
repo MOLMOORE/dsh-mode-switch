@@ -18,6 +18,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { catalogPath, loadCatalog, matchesAny } from './catalog.js'
+import { sessionEvidence } from './session-log.js'
 
 export const name = 'mode-switch'
 
@@ -27,6 +28,7 @@ export const inject = ['webServer']
 const STATUS_PATH = '/api/mode-switch/status'
 const DETAIL_PATH = '/api/mode-switch/detail'
 const SELECT_PATH = '/api/mode-switch/select'
+const VERIFY_PATH = '/api/mode-switch/verify'
 
 /** Rough token estimate: one token per four characters of the serialized schema. */
 const CHARS_PER_TOKEN = 4
@@ -35,14 +37,36 @@ const CHARS_PER_TOKEN = 4
 const DEFAULT_TOOLSET = 'mode-basic'
 
 export function apply(ctx) {
-  const catalog = loadCatalog((message) => ctx.logger?.('mode-switch')?.warn?.(message))
+  const log = (message) => ctx.logger?.('mode-switch')?.warn?.(message)
+  let catalog = loadCatalog(log)
   const live = new Map()
   /** Read-only diagnostics surfaced by the status route (never used by the UI). */
   const diag = { lastError: null, applied: [] }
   catalog.diag = diag
 
+  /**
+   * Re-read the user-editable catalog. `loadCatalog` memoises by mtime+size, so
+   * this is a stat per call, not a parse; an edit takes effect on the next
+   * status/detail/select/step instead of needing a DSH restart.
+   */
+  const refreshCatalog = () => {
+    const next = loadCatalog(log)
+    if (next !== catalog) {
+      catalog = next
+      catalog.diag = diag
+      diag.catalogReloads = (diag.catalogReloads ?? 0) + 1
+    }
+    return catalog
+  }
+
+  // Session records outlive the sessions they point at (deleted sessions,
+  // workspaces removed by hand). Drop those on load so the file stays a map of
+  // real sessions rather than a growing log of every id ever seen.
+  diag.prunedSessions = pruneSessions()
+
   /** Apply one toolset to one agent, replacing whatever it carried before. */
   const applyToolset = (agent, toolsetId) => {
+    refreshCatalog()
     const tools = ctx.get('tools')
     if (tools === undefined) return false
     const toolset = catalog.modes.find((entry) => entry.id === toolsetId)
@@ -144,6 +168,7 @@ export function apply(ctx) {
 
   /** Toolset this session should run: its stored choice, else the default. */
   const toolsetFor = (sessionId) => {
+    refreshCatalog()
     const store = readSessions()
     const stored = store[sessionId]
     // A stored value is either the plain preference (string) or the applied
@@ -214,12 +239,16 @@ export function apply(ctx) {
   })
 
   ctx.effect(
-    () => ctx.webServer.register({ kind: 'exact', path: STATUS_PATH, handler: route(ctx, statusPayload, catalog, live) }),
+    () => ctx.webServer.register({ kind: 'exact', path: STATUS_PATH, handler: route(ctx, statusPayload, refreshCatalog, live) }),
     'mode-switch: status route',
   )
   ctx.effect(
-    () => ctx.webServer.register({ kind: 'exact', path: DETAIL_PATH, handler: route(ctx, detailPayload, catalog, live) }),
+    () => ctx.webServer.register({ kind: 'exact', path: DETAIL_PATH, handler: route(ctx, detailPayload, refreshCatalog, live) }),
     'mode-switch: detail route',
+  )
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: VERIFY_PATH, handler: route(ctx, verifyPayload, refreshCatalog, live) }),
+    'mode-switch: verify route',
   )
   ctx.effect(
     () =>
@@ -237,7 +266,7 @@ export function apply(ctx) {
               const url = new URL(req.url ?? SELECT_PATH, 'http://localhost')
               const sessionId = url.searchParams.get('sessionId') ?? ''
               const toolset = url.searchParams.get('toolset') ?? ''
-              payload = selectPayload(ctx, catalog, sessionId, toolset, applyToolset, live)
+              payload = selectPayload(ctx, refreshCatalog(), sessionId, toolset, applyToolset, live)
             }
           } catch (error) {
             status = 500
@@ -254,13 +283,13 @@ export function apply(ctx) {
 }
 
 /** Wrap one payload builder into a JSON route handler. */
-function route(ctx, build, catalog, live) {
+function route(ctx, build, getCatalog, live) {
   return async (req, res) => {
     let status = 200
     let payload
     try {
       const url = new URL(req.url ?? '/', 'http://localhost')
-      payload = await build(ctx, url.searchParams.get('sessionId') ?? undefined, catalog, live)
+      payload = await build(ctx, url.searchParams.get('sessionId') ?? undefined, getCatalog(), live)
     } catch (error) {
       status = 500
       payload = { ok: false, error: error instanceof Error ? error.message : String(error) }
@@ -269,6 +298,24 @@ function route(ctx, build, catalog, live) {
     res.setHeader('content-type', 'application/json; charset=utf-8')
     res.setHeader('cache-control', 'no-store')
     res.end(JSON.stringify(payload))
+  }
+}
+
+/** Request-level evidence: what this session's requests really carried. */
+function verifyPayload(ctx, sessionId, catalog, live) {
+  if (sessionId === undefined || sessionId === '') return { ok: false, reason: 'no-session' }
+  const evidence = sessionEvidence(sessionId, catalog.modes)
+  const stored = readSessions()[sessionId]
+  const recorded = typeof stored === 'string' ? stored : stored?.mode
+  return {
+    ok: true,
+    sessionId,
+    log: evidence.log,
+    ...(evidence.error === undefined ? {} : { error: evidence.error }),
+    requestCount: evidence.requests.length,
+    requests: evidence.requests.slice(0, 20),
+    first: evidence.first,
+    recorded,
   }
 }
 
@@ -512,6 +559,49 @@ function readSessions() {
     return parsed !== null && typeof parsed === 'object' ? parsed : {}
   } catch {
     return {}
+  }
+}
+
+/**
+ * Drop records whose session directory no longer exists.
+ *
+ * Sessions live at `<home>/sessions/<workspace>/session-<id>/`; an id present in
+ * no workspace bucket belongs to a deleted session (or a workspace removed by
+ * hand). Nothing is dropped while the sessions tree is missing or empty — that
+ * means the home is wrong, not that every session vanished.
+ */
+export function pruneSessions() {  try {
+    const home = path.resolve(catalogPath(), '..', '..', '..')
+    const root = path.join(home, 'sessions')
+    const buckets = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory())
+    const known = new Set()
+    for (const bucket of buckets) {
+      let entries = []
+      try {
+        entries = fs.readdirSync(path.join(root, bucket.name), { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.startsWith('session-')) known.add(entry.name)
+      }
+    }
+    if (known.size === 0) return { removed: 0, kept: Object.keys(readSessions()).length }
+    const store = readSessions()
+    const kept = {}
+    const removed = []
+    for (const [id, value] of Object.entries(store)) {
+      if (!id.startsWith('session-') || known.has(id)) kept[id] = value
+      else removed.push(id)
+    }
+    if (removed.length > 0) {
+      const file = sessionsPath()
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      fs.writeFileSync(file, `${JSON.stringify(kept, null, 2)}\n`, 'utf8')
+    }
+    return { removed: removed.length, kept: Object.keys(kept).length }
+  } catch {
+    return { removed: 0 }
   }
 }
 
