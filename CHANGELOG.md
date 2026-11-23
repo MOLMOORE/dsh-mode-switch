@@ -1,5 +1,76 @@
 # 变更记录
 
+## 0.4.6 — 2026-11-23
+
+修两处一直存在、但直到现场体检才量出来的缺陷（体检报告见 `docs/mode-switch-audit-2026-11-09.md`
+于主工作区，判定方法与数据在 `evidence/2026-11-09/`），并修好宿主 0.2.2-rc.5 之后全线失效的
+换档按钮（见下节）。
+
+### 换档按钮全线失效（宿主 0.2.2-rc.5）
+
+现象：胶囊上四个档位按钮全是灰的，连刚开、一个字都没发的新会话也点不动，
+提示「本会话档位已固定，新开会话可选」。
+
+两层原因叠在一起，各自都足以让换档失效：
+
+1. **空白判定读的是已弃用接口。** 0.2.2-rc.5 把 `sessionProjections.stateOf(session, 'turnBoundary')`
+   标成 deprecated（`refs === 0` 时返回 `undefined`，新会话还会先返回初始态）。插件把它读成
+   「没有投影信息 = 空白」，于是 `blank` 不可信；`fixed` 又写成 `!blank || applied`，而默认档在
+   `agent/created` 时就已经应用（`applied` 恒为 true），结果每个活跃会话都 `fixed: true`。
+2. **即使放行，选择也不会生效。** `select` 只写 `sessions.json` 就返回 `applied: false`，
+   而 `applyToolset` 早在会话创建时就把旧限制挂上去了；`ensureToolset` 又因 `live.has()` 提前返回。
+   于是面板会显示新档位，请求里发的仍是旧档位。
+
+修法：
+
+- 空白判定改走宿主自己的谓词 `agents.turnBoundaryOf(session)`（`dsh-api-session-controller`
+  的 `isBlank()` 用的就是它），旧投影读法只作回退；两种读法都失败时按"已开始"处理——
+  拒绝一次换档可以重来，误裁一个已经发过请求的会话不能。
+- `fixed` 只看空白：`agent !== undefined && !blank`。已经开始对话的会话仍然固定（0.5.0 才放开）。
+- `select` 在写记录之后对活着的 agent 再跑一次 `applyToolset()`：旧限制 disposer 被撤销、
+  新集合随即安装、提示段过滤器按新档位重建，**下一个请求**生效。
+- 回归测试：空白会话 `fixed:false` 且 select 真的重新 restrict；已开始的会话 `fixed:true`
+  且 select 回 `session-started`。
+
+### 提示段裁剪从未命中
+
+`trimPromptSections()` 按 `section.name === family` 精确匹配，而贡献者的真实 section 名是
+`office:guide` 与 `academic:guide`（`paper_*` 与 `zotero_*` 共用后者）。结果：deny 只裁掉了工具，
+基础档每个请求仍带着 Office 3,685 字符、Academic 5,423 字符的提示段（约 2.4k tok），
+并且还在教模型调用已经裁掉的 `office_edit` / `paper_search`。
+
+- 改为先取 section 名第一个 `:` 之前的部分比对家族，再走 `SECTION_GROUPS`：
+  `academic:guide` 只有在 `paper_*` 与 `zotero_*` **同时**被禁时才删（否则留着给仍在可见的
+  另一半工具用），`mcp-resource-servers` 只在 `mcp__*` 时删。
+- 单禁一台 MCP 服务器（`mcp__solidworks__*`）不删共享的服务器清单段；只有 `mcp__*` 才删。
+- `diag.promptTrim` 记录最近一次实际删除的会话、家族、段数与字符数——用于区分
+  「过滤器装上了」和「装上了但一个段都没匹配到」。
+- 回归测试改用真实 section 名（`office:guide` / `academic:guide` / `mcp-resource-servers`），
+  不再只用合成的同名段。
+
+### 面板各档口径不一致
+
+measured 行用会话可见表（含 preset 工具），估算行只算全局表，于是办公档显示 58 个工具 /
+17.2k，看起来比基础档 78 / 19.5k 还小——而办公档的 deny 是基础档的子集，真实是 113 / 30.7k；
+全量档显示 159 / 46.1k，真实 214 / 59.6k；基础档「省」显示 26.5k，真实 40.0k。
+
+- 估算行统一加上本会话的 preset 开销（`visible − 全局可见`），基线与 measured 行同口径。
+- `estimateToolset()` 接收 `{ count, chars }` 额外项，并导出以供回归测试。
+
+### 文档
+
+- README / README.en：数字更新为 214 工具 / 59.6k（全量）与 78 / 19.6k（基础），
+  删掉「工具表在首次组装时固定」的旧说法。
+- LIMITATIONS §2、§3 与 ARCHITECTURE 同步新的裁剪规则与估算口径。
+
+## 更正 — 2026-11-06
+
+**推翻 0.4.0 的一条结论**：原文写「工具目录在首次组装后固定、`restrict()` 只能叠加、disposer 摘不掉」，据此把「对话开始后不可切档」归因为宿主限制。
+
+核对 dsh-tools 0.2.2-rc.1 源码与 README 后确认事实相反：`restrict()` 用 `layers.effect()` 挂限制，返回的 disposer 会 `undo()` 掉它（README: *the restriction lifts when disposed*）；可见工具集由 `view(scope)` 每次现算；被定稿的只有**单个请求**（`tools.resolve()` + `assemble()` 早于 `agent/pre-step`）。当初「工具数不回升」多半是量了不带 scope 的 `tools.schemas()`（全局表，不受 agent 限制影响）。
+
+所以「不能中途换档」是产品决定，不是宿主限制；相关文档（`README.md`、`README.en.md`、`docs/LIMITATIONS.md`、`docs/ARCHITECTURE.md`）已更正，换档设计排入 0.5.0。
+
 ## 0.4.5 — 2026-11-04
 
 修「点进一个对话先显示未知档，切到别的对话再切回来才对」。
@@ -175,7 +246,7 @@
 
 ### 决策
 - **不声明 preset**：早期版本把档位实现成 4 条 preset，结果顶掉了官方的标准/PTC/极简/创造模式，且和官方模式挤在同一个下拉里。改为"插件只裁工具、preset 保持官方"。
-- **档位在开工前确定**：实测工具目录在 agent 首次组装后固定，`restrict()` 的 disposer 调用不报错但摘不掉限制（只能叠加）。因此对话开始后不再允许切档。
+- **档位在开工前确定**：实测工具目录在 agent 首次组装后固定，`restrict()` 的 disposer 调用不报错但摘不掉限制（只能叠加）。因此对话开始后不再允许切档。*（2026-11-06 更正：此测量结论有误，见文首「更正」。）*
 - **默认基础档**：未选择时在第一条消息前套基础档，避免用户忘记选而吃满 54.8k。
 - **老会话不改写**：插件安装前创建的会话保持原工具集，显示为「全量档」。
 

@@ -8,7 +8,7 @@ fs.rmSync(home, { recursive: true, force: true })
 fs.mkdirSync(home, { recursive: true })
 process.env.DSH_HOME = home
 
-const { apply, sectionFamilies, trimPromptSections, pruneSessions, resolveModeId, normalizeModes } = await import('../index.js')
+const { apply, sectionFamilies, trimPromptSections, estimateToolset, pruneSessions, resolveModeId, normalizeModes } = await import('../index.js')
 const { loadCatalog } = await import('../catalog.js')
 const { requestEvidence } = await import('../session-log.js')
 const { buildAutoPrompt, parseModesJson } = await import('../auto.js')
@@ -36,7 +36,14 @@ function makeCtx() {
     },
     get(name) {
       if (name === 'tools') return { schemas: () => tools }
-      if (name === 'agents') return { list: () => [] }
+      // Host 0.2.2-rc.5 exposes the blank predicate as `agents.turnBoundaryOf`;
+      // a fake ctx without it would model a host this plugin no longer supports.
+      if (name === 'agents') {
+        return {
+          list: () => [],
+          turnBoundaryOf: () => ({ openTurnStartSeq: null, lastTurn: 0 }),
+        }
+      }
       return undefined
     },
     webServer: { register: () => () => {} },
@@ -111,6 +118,88 @@ console.log('resume of an old session restrictCalls =', calls.length - beforeRes
 const afterResume = JSON.parse(fs.readFileSync(path.join(home, 'state', 'mode-switch', 'sessions.json'), 'utf8'))
 console.log('resume of an old session writes no record =', afterResume['session-old'] === undefined ? 'OK' : 'FAIL (persisted the default)')
 
+// Blank-session switching (host 0.2.2-rc.5 regression): a live agent already
+// carries the default toolset from the creation hook, so `applied` is true from
+// the first moment. `fixed` must follow blankness alone — otherwise every pill
+// is disabled and no conversation can ever choose a toolset.
+const switchRoutes = new Map()
+const switchApplies = []
+const switchTools = [
+  { name: 'mcp__solidworks__x' },
+  { name: 'office_edit' },
+  { name: 'fs_read' },
+]
+const blankAgent = {
+  id: 'session-blank',
+  session: { seq: 1 },
+  ctx: { on: () => () => {}, tools: { restrict({ deny }) { switchApplies.push(deny); return () => {} } } },
+}
+const startedAgent = {
+  id: 'session-started',
+  session: { seq: 9 },
+  ctx: { on: () => () => {}, tools: { restrict() { return () => {} } } },
+}
+const boundaryOf = (session) => (session === startedAgent.session
+  ? { openTurnStartSeq: 5, lastTurn: 1 }
+  : { openTurnStartSeq: null, lastTurn: 0 })
+const switchCtx = {
+  handlers: new Map(),
+  logger: () => ({ warn: () => {}, info: () => {} }),
+  on(name, fn) {
+    if (!switchCtx.handlers.has(name)) switchCtx.handlers.set(name, [])
+    switchCtx.handlers.get(name).push(fn)
+    return () => {}
+  },
+  effect(fn) {
+    return fn()
+  },
+  get(name) {
+    if (name === 'tools') return { schemas: () => switchTools }
+    if (name === 'agents') {
+      return {
+        list: () => [blankAgent, startedAgent],
+        get: (id) => [blankAgent, startedAgent].find((agent) => agent.id === id),
+        turnBoundaryOf: boundaryOf,
+      }
+    }
+    return undefined
+  },
+  webServer: {
+    register(def) {
+      switchRoutes.set(def.path, def.handler)
+      return () => {}
+    },
+  },
+}
+apply(switchCtx)
+const callRoute = async (routePath, url, method = 'GET') => {
+  const res = {
+    statusCode: 0,
+    headers: {},
+    setHeader(key, value) { this.headers[key] = value },
+    end(body) { this.body = body },
+  }
+  await switchRoutes.get(routePath)({ url, method }, res)
+  return { status: res.statusCode, body: res.body === undefined ? undefined : JSON.parse(res.body) }
+}
+switchCtx.handlers.get('agent/created')?.[0]?.({ agent: blankAgent, source: 'startup' })
+await new Promise((resolve) => setTimeout(resolve, 20))
+const blankStatus = (await callRoute('/api/mode-switch/status', '/api/mode-switch/status?sessionId=session-blank')).body
+console.log('blank live session stays switchable =',
+  blankStatus.blank === true && blankStatus.fixed === false ? 'OK' : `FAIL (blank=${blankStatus.blank} fixed=${blankStatus.fixed})`)
+const switched = (await callRoute('/api/mode-switch/select', '/api/mode-switch/select?sessionId=session-blank&toolset=mode-office', 'POST')).body
+console.log('select re-applies to a live agent =',
+  switched.ok === true && switched.applied === true && switchApplies.length === 2 ? 'OK' : `FAIL (${JSON.stringify(switched)}, applies=${switchApplies.length})`)
+const switchedRecord = JSON.parse(fs.readFileSync(path.join(home, 'state', 'mode-switch', 'sessions.json'), 'utf8'))
+console.log('select persists the choice =', switchedRecord['session-blank']?.mode === 'mode-office' ? 'OK' : 'FAIL')
+const afterSwitch = (await callRoute('/api/mode-switch/status', '/api/mode-switch/status?sessionId=session-blank')).body
+console.log('status reports the applied toolset =', afterSwitch.toolset === 'mode-office' ? 'OK' : `FAIL (${afterSwitch.toolset})`)
+const startedStatus = (await callRoute('/api/mode-switch/status', '/api/mode-switch/status?sessionId=session-started')).body
+console.log('started session is fixed =',
+  startedStatus.blank === false && startedStatus.fixed === true ? 'OK' : `FAIL (blank=${startedStatus.blank} fixed=${startedStatus.fixed})`)
+const refused = (await callRoute('/api/mode-switch/select', '/api/mode-switch/select?sessionId=session-started&toolset=mode-office', 'POST')).body
+console.log('started session refuses a switch =', refused.ok === false && refused.reason === 'session-started' ? 'OK' : `FAIL (${JSON.stringify(refused)})`)
+
 // Prompt sections: a toolset that denies `<family>_*` also drops the prompt
 // section the same plugin contributes (lunheng appends `{ name: 'lunheng' }`).
 const basic = { id: 'mode-basic', deny: ['mcp__solidworks__*', 'lunheng_*'] }
@@ -127,6 +216,48 @@ const trimmed = trimPromptSections(assembly, sectionFamilies(basic))
 console.log('basic drops lunheng section =', trimmed.sections.length === 1 && trimmed.sections[0].name === 'base' ? 'OK' : 'FAIL')
 console.log('other sections untouched =', trimmed.variables === assembly.variables ? 'OK' : 'FAIL')
 console.log('office keeps lunheng section =', trimPromptSections(assembly, sectionFamilies(office)) === assembly ? 'OK' : 'FAIL')
+
+// Real section names are not the family name: the office plugin registers
+// `office:guide`, and `academic:guide` serves both paper_* and zotero_*. A plain
+// string equality check silently trims nothing — the bug this guards against.
+const realNames = {
+  variables: {},
+  sections: [
+    { name: 'base', text: 'base' },
+    { name: 'office:guide', text: 'office guide' },
+    { name: 'academic:guide', text: 'academic guide' },
+    { name: 'mcp-resource-servers', text: 'servers' },
+  ],
+}
+const keptNames = (families) => trimPromptSections(realNames, families).sections.map((section) => section.name).join(',')
+console.log('office family drops office:guide =',
+  keptNames(['office']) === 'base,academic:guide,mcp-resource-servers' ? 'OK' : `FAIL (${keptNames(['office'])})`)
+console.log('paper alone keeps academic:guide =',
+  keptNames(['paper']) === 'base,office:guide,academic:guide,mcp-resource-servers' ? 'OK' : `FAIL (${keptNames(['paper'])})`)
+console.log('paper+zotero drops academic:guide =',
+  keptNames(['paper', 'zotero']) === 'base,office:guide,mcp-resource-servers' ? 'OK' : `FAIL (${keptNames(['paper', 'zotero'])})`)
+console.log('mcp family drops mcp-resource-servers =',
+  keptNames(['mcp']) === 'base,office:guide,academic:guide' ? 'OK' : `FAIL (${keptNames(['mcp'])})`)
+console.log('single mcp server keeps shared section =',
+  trimPromptSections(realNames, ['mcp__solidworks']) === realNames ? 'OK' : 'FAIL')
+
+// Footprint: preset/agent-scoped tools are in every toolset, so estimates for
+// other toolsets must include them — otherwise the measured row and the other
+// rows are on different bases (office appeared smaller than basic).
+const globalsForFootprint = [
+  { name: 'a', description: 'a' },
+  { name: 'mcp__solidworks__x', description: 'x' },
+  { name: 'office_edit', description: 'y' },
+]
+const presetExtra = { count: 1, chars: JSON.stringify({ name: 'ops_bash', description: 'z' }).length }
+const basicEstimate = estimateToolset(globalsForFootprint, { deny: ['mcp__solidworks__*', 'office_*'] }, presetExtra)
+const officeEstimate = estimateToolset(globalsForFootprint, { deny: ['mcp__solidworks__*'] }, presetExtra)
+console.log('footprint adds preset tools =', basicEstimate.tools === 2 ? 'OK' : `FAIL (${basicEstimate.tools})`)
+console.log('footprint keeps mode ordering =', officeEstimate.tools > basicEstimate.tools ? 'OK' : 'FAIL')
+console.log('footprint adds preset tokens =',
+  basicEstimate.estimatedTokens > Math.round(JSON.stringify(globalsForFootprint[0]).length / 4) ? 'OK' : 'FAIL')
+console.log('footprint without extra stays global-only =',
+  estimateToolset(globalsForFootprint, { deny: ['mcp__solidworks__*', 'office_*'] }).tools === 1 ? 'OK' : 'FAIL')
 
 // The created path must install the filter on the agent scope, prepended so its
 // next() sees the sections the trimmed plugin appended.
@@ -152,6 +283,68 @@ if (filter !== undefined) {
   console.log('filter output sections =', filtered.sections.map((section) => section.name).join(','),
     filtered.sections.length === 1 && filtered.sections[0].name === 'base' ? 'OK' : 'FAIL')
 }
+
+// Detail route: an estimate for a toolset the session does NOT run must include
+// the preset tools the session actually carries. Without them, office (whose
+// deny set is a subset of basic's) is reported with fewer tools than basic — the
+// bug this guards against.
+const detailGlobals = [
+  { name: 'a', description: 'a' },
+  { name: 'office_edit', description: 'office' },
+  { name: 'mcp__solidworks__x', description: 'cad' },
+]
+const detailSession = [...detailGlobals, { name: 'ops_bash', description: 'preset tool' }]
+const detailAgent = { id: 'session-detail', session: {}, ctx: {} }
+const detailRoutes = new Map()
+const detailCtx = {
+  handlers: new Map(),
+  logger: () => ({ warn: () => {}, info: () => {} }),
+  on(name, fn) {
+    if (!detailCtx.handlers.has(name)) detailCtx.handlers.set(name, [])
+    detailCtx.handlers.get(name).push(fn)
+    return () => {}
+  },
+  effect(fn) {
+    return fn()
+  },
+  get(name) {
+    if (name === 'tools') {
+      return { schemas: (agent) => (agent === undefined ? detailGlobals : detailSession) }
+    }
+    if (name === 'agents') {
+      return {
+        list: () => [],
+        get: (id) => (id === 'session-detail' ? detailAgent : undefined),
+        turnBoundaryOf: () => ({ openTurnStartSeq: null, lastTurn: 0 }),
+      }
+    }
+    return undefined
+  },
+  webServer: {
+    register(def) {
+      detailRoutes.set(def.path, def.handler)
+      return () => {}
+    },
+  },
+}
+apply(detailCtx)
+fs.writeFileSync(path.join(home, 'state', 'mode-switch', 'sessions.json'),
+  JSON.stringify({ 'session-detail': { mode: 'mode-full', appliedAt: '2026-11-01T00:00:00.000Z' } }), 'utf8')
+const detailRes = {
+  statusCode: 0,
+  headers: {},
+  setHeader(key, value) { this.headers[key] = value },
+  end(body) { this.body = body },
+}
+await detailRoutes.get('/api/mode-switch/detail')({ url: '/api/mode-switch/detail?sessionId=session-detail' }, detailRes)
+const detailData = JSON.parse(detailRes.body)
+const detailRow = (id) => detailData.toolsets.find((mode) => mode.id === id)
+console.log('detail route responds =', detailData.ok === true ? 'OK' : 'FAIL')
+console.log('detail measured full row =', detailRow('mode-full')?.tools === 4 ? 'OK' : `FAIL (${detailRow('mode-full')?.tools})`)
+console.log('detail basic estimate includes preset =', detailRow('mode-basic')?.tools === 2 ? 'OK' : `FAIL (${detailRow('mode-basic')?.tools})`)
+console.log('detail office estimate includes preset =', detailRow('mode-office')?.tools === 3 ? 'OK' : `FAIL (${detailRow('mode-office')?.tools})`)
+console.log('detail modeling estimate includes preset =', detailRow('mode-modeling')?.tools === 3 ? 'OK' : `FAIL (${detailRow('mode-modeling')?.tools})`)
+console.log('detail baseline includes preset =', detailData.baseline?.tools === 4 ? 'OK' : `FAIL (${detailData.baseline?.tools})`)
 
 // Request evidence: the verify route reads `request/header` events, so the
 // parser must count real tool names and score them against each mode's deny.
@@ -243,7 +436,12 @@ const restrictCalls = []
 const recCtx = makeCtx()
 recCtx.get = (name) => {
   if (name === 'tools') return { schemas: () => tools }
-  if (name === 'agents') return { list: () => recAgents }
+  if (name === 'agents') {
+    return {
+      list: () => recAgents,
+      turnBoundaryOf: () => ({ openTurnStartSeq: null, lastTurn: 0 }),
+    }
+  }
   return undefined
 }
 const emit = (name, payload) => {
