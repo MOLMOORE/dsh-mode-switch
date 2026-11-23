@@ -276,7 +276,26 @@ export function apply(ctx) {
         async (_assembly, _context, next) => {
           const assembled = await next()
           try {
-            return timed('assemble-filter', () => trimPromptSections(assembled, families))
+            const result = timed('assemble-filter', () => trimPromptSections(assembled, families))
+            const before = Array.isArray(assembled?.sections) ? assembled.sections.length : 0
+            const after = Array.isArray(result?.sections) ? result.sections.length : before
+            if (after < before) {
+              // Evidence that the filter reached a real section: without it the
+              // panel cannot tell "installed" from "matched nothing" (the name
+              // scheme of the contributing plugin is outside our control).
+              const keptNames = new Set((result.sections ?? []).map((section) => section?.name))
+              const droppedChars = (assembled.sections ?? [])
+                .filter((section) => !keptNames.has(section?.name))
+                .reduce((sum, section) => sum + String(section?.text ?? '').length, 0)
+              diag.promptTrim = {
+                sessionId: agent.id,
+                families,
+                dropped: before - after,
+                droppedChars,
+                at: new Date().toISOString(),
+              }
+            }
+            return result
           } catch (error) {
             ctx.logger?.('mode-switch')?.warn?.(`prompt section filter skipped: ${error?.message ?? error}`)
             return assembled
@@ -310,6 +329,23 @@ export function apply(ctx) {
       const ms = Math.round(clock() - started)
       if (ms >= 200) noteSlow(label, ms)
     }
+  }
+
+  /**
+   * Take one toolset for an agent that is already alive.
+   *
+   * `applyToolset()` disposes the previous restriction and installs the new one
+   * (an empty deny set simply lifts it), then the choice is recorded and the
+   * prompt-section filter is rebuilt for the new families. The change reaches
+   * the wire on the next request: turn resolution happens before `pre-step`.
+   * @returns whether the restriction is in place afterwards.
+   */
+  const applyLive = (agent, toolsetId) => {
+    const id = resolveModeId(catalog, toolsetId)
+    if (!applyToolset(agent, id)) return false
+    recordApplied(agent.id, id)
+    installPromptFilter(agent, id)
+    return true
   }
 
   /** Toolset this session should run: its stored choice, else the default. */
@@ -384,9 +420,11 @@ export function apply(ctx) {
     if (agent?.id === undefined) return
     // Trim at creation, one macrotask later, because this is the only moment
     // BEFORE the first request is assembled: `agent/pre-step` is too late — the
-    // harness calls `systemPrompt.assemble()` (which freezes the tool list)
+    // harness resolves the step's tool set and calls `systemPrompt.assemble()`
     // before it dispatches that waterfall, so a trim applied there only reaches
-    // the second request.
+    // the second request. (It is only the FIRST request that needs this timing:
+    // the restriction itself is disposable and `view(scope)` is recomputed per
+    // request, see docs/ARCHITECTURE.md "会话中换档".)
     // The deferral is required: inside agent/created the agent's scope is still
     // being bound, and restrict() there would re-link the scope key and fail the
     // whole session creation.
@@ -529,7 +567,7 @@ export function apply(ctx) {
               const url = new URL(req.url ?? SELECT_PATH, 'http://localhost')
               const sessionId = url.searchParams.get('sessionId') ?? ''
               const toolset = url.searchParams.get('toolset') ?? ''
-              payload = selectPayload(ctx, refreshCatalog(), sessionId, toolset, applyToolset, live)
+              payload = selectPayload(ctx, refreshCatalog(), sessionId, toolset, applyLive, live)
             }
           } catch (error) {
             status = 500
@@ -637,7 +675,10 @@ function statusPayload(ctx, sessionId, catalog, live) {
     toolset: toolset?.id,
     toolsetName: toolset?.name,
     blank,
-    fixed: agent !== undefined && (!blank || applied),
+    // A conversation that has not started a turn can still choose its toolset,
+    // even though the default one is already applied to the agent: the choice is
+    // a live re-apply (selectPayload), not a first-request-only decision.
+    fixed: agent !== undefined && !blank,
     applied,
     projected,
     toolsets: [...catalog.modes]
@@ -669,13 +710,23 @@ async function detailPayload(ctx, sessionId, catalog, live) {
   const globals = globalSchemas(ctx)
   const applied = agent !== undefined && live.has(agent.id)
   const recorded = agent === undefined ? undefined : recordedToolset(agent.id)
-  const trimmed = applied || recorded !== undefined
-  // Estimate an untrimmed session from its own schema list (it already carries
-  // the preset/agent-scoped tools); a trimmed one can only be estimated from the
-  // global registry, because its visible list can no longer be widened.
-  const estimateBase = agent !== undefined && !trimmed ? schemas : globals
-  // Baseline for "how much does this mode save": every global tool visible.
-  const baseline = estimateToolset(estimateBase, { deny: [] })
+  // Preset/agent-scoped tools are visible in every toolset: `deny` rules only
+  // reach the global registry. They have to be added to every estimate too, or
+  // the current (measured) row and the other rows would be measured on
+  // different bases — office would look smaller than basic even though its deny
+  // set is a subset of basic's.
+  const globalNames = new Set(globals.map((schema) => (typeof schema?.name === 'string' ? schema.name : '')))
+  const preset = schemas.filter((schema) => {
+    const name = typeof schema?.name === 'string' ? schema.name : ''
+    return name !== '' && !globalNames.has(name)
+  })
+  const presetExtra = {
+    count: preset.length,
+    chars: preset.reduce((sum, schema) => sum + JSON.stringify(schema).length, 0),
+  }
+  // Baseline for "how much does this mode save": the full registry, which is
+  // every global tool plus the preset overhead every session carries.
+  const baseline = estimateToolset(globals, { deny: [] }, presetExtra)
   const toolsets = []
   for (const entry of [...catalog.modes].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))) {
     const current = entry.id === currentId
@@ -685,7 +736,7 @@ async function detailPayload(ctx, sessionId, catalog, live) {
     const measured = current && (applied || (entry.deny ?? []).length === 0 || recorded === entry.id)
     const footprint = measured
       ? { tools: tools.length, estimatedTokens: Math.round(chars / CHARS_PER_TOKEN), measured: true }
-      : estimateToolset(estimateBase, entry)
+      : estimateToolset(globals, entry, presetExtra)
     toolsets.push({
       id: entry.id,
       name: entry.name,
@@ -720,8 +771,16 @@ async function detailPayload(ctx, sessionId, catalog, live) {
   }
 }
 
-/** Estimate a toolset from the global registry alone (preset tools are equal in every toolset). */
-function estimateToolset(globals, toolset) {
+/**
+ * Estimate a toolset from the global registry plus the session's preset
+ * overhead.
+ *
+ * `extra` carries the preset/agent-scoped schemas (`{ count, chars }`): they are
+ * not in the global registry, are not affected by `deny`, and every toolset
+ * carries them, so leaving them out of non-current rows puts those rows on a
+ * different basis than the measured one.
+ */
+export function estimateToolset(globals, toolset, extra = { count: 0, chars: 0 }) {
   let chars = 0
   let count = 0
   for (const schema of globals) {
@@ -730,22 +789,32 @@ function estimateToolset(globals, toolset) {
     chars += JSON.stringify(schema).length
     count += 1
   }
-  return { tools: count, estimatedTokens: Math.round(chars / CHARS_PER_TOKEN) }
+  return {
+    tools: count + (extra.count ?? 0),
+    estimatedTokens: Math.round((chars + (extra.chars ?? 0)) / CHARS_PER_TOKEN),
+  }
 }
 
 /** Switch one session's toolset: persist the choice, then apply it live. */
-function selectPayload(ctx, catalog, sessionId, toolsetId, applyToolset, live) {
+function selectPayload(ctx, catalog, sessionId, toolsetId, applyLive, live) {
   if (sessionId === '') return { ok: false, reason: 'no-session' }
   if (!catalog.modes.some((entry) => entry.id === toolsetId)) return { ok: false, reason: 'unknown-toolset' }
   const agent = liveAgent(ctx, sessionId)
   if (agent === undefined) return { ok: false, reason: 'no-live-agent' }
-  // The toolset is a pre-flight decision: once the session has started a turn
-  // the tool catalog is assembled and cannot be widened, so the choice is closed.
+  // The choice belongs to a conversation that has not started a turn yet: past
+  // that point the toolset is a fixed property of the session (see
+  // docs/LIMITATIONS.md §1; mid-session switching is 0.5.0 work).
   if (!sessionBlank(ctx, agent)) {
     return { ok: false, reason: 'session-started', toolset: displayedToolset(ctx, catalog, agent, live, sessionId) }
   }
   writeSession(sessionId, toolsetId)
-  return { ok: true, toolset: toolsetId, stored: true, applied: false }
+  // The agent already carries the default toolset by the time the panel is
+  // usable, so recording the choice is not enough: re-apply it to this agent
+  // (the previous restriction is disposed, the new one is installed). Without
+  // this the first request would still run the toolset the session was created
+  // with, and the panel would name a mode the request never carried.
+  const applied = typeof applyLive === 'function' ? applyLive(agent, toolsetId) : false
+  return { ok: true, toolset: toolsetId, stored: true, applied }
 }
 
 /**
@@ -800,15 +869,35 @@ function recordedToolset(sessionId) {
   return undefined
 }
 
-/** Whether this session has not started a turn yet (informational only). */
+/**
+ * Whether no turn has started in this session yet.
+ *
+ * The host owns this predicate and exposes it as `agents.turnBoundaryOf(session)`
+ * (dsh-api-session-controller's own `isBlank()` uses exactly that call). The
+ * older `sessionProjections.stateOf(session, 'turnBoundary')` registry read is
+ * deprecated and no longer reliable: on 0.2.2-rc.5 it answers with the initial
+ * state (or `undefined`) for a freshly created session, which made every new
+ * conversation read as blank-or-not at random. Keep it only as a fallback for
+ * hosts that predate `turnBoundaryOf`.
+ *
+ * Unknown answers are treated as "started": refusing a switch is recoverable,
+ * trimming a conversation that already sent a request is not.
+ */
 function sessionBlank(ctx, agent) {
+  const read = (boundary) => boundary.openTurnStartSeq === null && boundary.lastTurn === 0
+  try {
+    const boundary = ctx.get('agents')?.turnBoundaryOf?.(agent.session)
+    if (boundary !== undefined && boundary !== null) return read(boundary)
+  } catch {
+    // Fall through to the legacy read.
+  }
   try {
     const boundary = ctx.get('sessionProjections')?.stateOf(agent.session, 'turnBoundary')
-    if (boundary === undefined) return true
-    return boundary.openTurnStartSeq === null && boundary.lastTurn === 0
+    if (boundary !== undefined && boundary !== null) return read(boundary)
   } catch {
-    return false
+    // Fall through to the safe answer.
   }
+  return false
 }
 
 /** @returns {object | undefined} the live Agent registered for this session id. */
@@ -962,17 +1051,47 @@ export function sectionFamilies(toolset) {
 }
 
 /**
+ * Prompt sections that belong to a group of tool families rather than to one
+ * name, and the families that must ALL be denied before the section goes.
+ *
+ * Two real cases on this machine: `@copylee/dsh-academic` serves `paper_*` and
+ * `zotero_*` from one `academic:guide` section (dropping it while zotero stays
+ * visible would remove the guidance for tools the model still has), and the host
+ * serves every MCP server's name list from `mcp-resource-servers`. A single
+ * server deny (`mcp__solidworks__*`) must not drop the list, or the other
+ * servers lose their names; only `mcp__*` covers all of them.
+ */
+const SECTION_GROUPS = [
+  { section: 'academic', families: ['paper', 'zotero'] },
+  { section: 'mcp-resource-servers', families: ['mcp'] },
+]
+
+/**
  * Drop prompt sections owned by denied tool families from one assembly result.
  * Returns the input untouched when nothing matches, so callers can hand the
  * result to the next contributor unchanged.
+ *
+ * A section is dropped when its name (or the part before the first `:`, so
+ * `office:guide` belongs to `office`) is a denied family, or when a
+ * `SECTION_GROUPS` rule has every one of its families denied. Matching is
+ * case-insensitive.
  */
 export function trimPromptSections(assembled, families) {
   if (!Array.isArray(families) || families.length === 0) return assembled
   const sections = assembled?.sections
   if (!Array.isArray(sections)) return assembled
+  const dropped = new Set()
+  for (const family of families) {
+    const name = String(family).toLowerCase().trim()
+    if (name !== '') dropped.add(name)
+  }
+  for (const rule of SECTION_GROUPS) {
+    if (rule.families.every((family) => dropped.has(family))) dropped.add(rule.section)
+  }
   const kept = sections.filter((section) => {
-    const name = String(section?.name ?? '').toLowerCase()
-    return name === '' || !families.includes(name)
+    const name = String(section?.name ?? '').toLowerCase().trim()
+    if (name === '') return true
+    return !dropped.has(name) && !dropped.has(name.split(':')[0].trim())
   })
   if (kept.length === sections.length) return assembled
   return { ...assembled, sections: kept }
