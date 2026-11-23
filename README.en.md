@@ -48,8 +48,11 @@ indistinguishable from Office. Check your own tool list, or run "AI assign", ins
 
 ## Why fewer tools help
 
-- Token cost: 198 tools / ~54.8k tokens on the author's machine versus 62 / ~14.9k in the basic profile. The
-  tool list is fixed at first assembly and sent with every request, so the saving repeats for the whole session.
+- Token cost: 214 tools / ~59.6k tokens on the author's machine versus 78 / ~19.6k in the basic profile. The
+  same tool set is resolved and sent with every request until the profile changes, so the saving repeats for
+  the whole session.
+- Prompt sections are trimmed together with their tool family (the office, academic and MCP-resource server
+  sections are mapped by name), so a denied family does not keep narrating itself in the system prompt.
 - Less distraction: a long tool list means more irrelevant descriptions and more chances to pick the wrong tool
   or reach for something the current task does not need. This is a working observation, not a measured result.
 - Fewer detours: with browser and CAD tools gone, the model does not keep weighing whether to use them.
@@ -58,7 +61,9 @@ indistinguishable from Office. Check your own tool list, or run "AI assign", ins
 
 - Global tools only. Preset and agent-scoped tools cannot be trimmed.
 - Other plugins' UI cards cannot be hidden; the slots API has no third-party removal.
-- No switching once a session has sent its first message.
+- No switching once a session has sent its first message, in the current build. The host itself allows it
+  (a restriction can be disposed, the tool set is resolved per request); the blocking is a product decision
+  that keeps one profile per session, and mid-session switching is slated for 0.5.0.
 - Rules are names. A renamed or newly installed tool needs a matching rule.
 - "AI assign" makes one model call through the default route; it costs what your provider charges.
 
