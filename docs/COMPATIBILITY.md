@@ -3,8 +3,10 @@
 DSH 内核升级后按这个清单过一遍。**每一项都写清「插件依赖它做什么」和「它变了会怎么坏」**，
 以及现在怎么验证。全部黑盒可验的项放在最前面，不需要读宿主源码。
 
-最近核对：**2026-11-17，宿主 `@deepseek-ai/dsh-desktop-runtime` 0.2.2-rc.1 → 0.2.2-rc.3**，全项通过，
-插件未改代码。前一次为 2026-11-04（0.2.1-rc.5 → 0.2.2-rc.1），同样全项通过。
+最近核对：**2026-11-23，宿主 `@deepseek-ai/dsh-desktop-runtime` 0.2.3-alpha.2**（11:02 更新）——
+发现换档按钮全线失效（契约 10 变了，见下表），插件修好后在 alpha.2 上验到线上：
+新会话选办公档 → 首个请求 99 个工具、`mode-office` leaks 0。此前两次核对为 2026-11-17（rc.3）与
+2026-11-04（rc.1），均全项通过、插件未改代码。
 
 0.2.2-rc.3 的新增约束（插件已满足，但要记住）：`restrict()` 现在要求**作用域上下文**
 （`agent.ctx`，全局上下文直接抛错）、拒绝空 filter、拒绝保留名 `run_code`，并把未知名校验
@@ -32,8 +34,15 @@ Invoke-RestMethod "http://127.0.0.1:$port/api/mode-switch/verify?sessionId=<当�
 Invoke-RestMethod "http://127.0.0.1:$port/api/mode-switch/detail?sessionId=<当前会话id>"
 
 # 5) 胶囊真的渲染：截图看输入框上方那一行「● 档位 xxx · 预设 · n 工具 · ≈x.xk tok schema」
-& tools\capture-screen.ps1 -Out "evidence\<日期>\compat.png" -Pid2 <DeepSeek Harness 的 pid>
+& tools\capture-window.ps1 -Pid2 <DeepSeek Harness 的 pid> -Out "evidence\<日期>\compat.png"
 ```
+
+> **0.2.3-alpha.2 起裸 HTTP 探测会 401**（`unauthorized`）：Web 服务用 `dsh-auth-<hash>` cookie
+> 鉴权，页面带着 cookie 正常，curl / `Invoke-RestMethod` 不带就是 401。遇到 401 先别当插件坏了——
+> 看页面里的胶囊有没有数字，或直接读 `sessions/<bucket>/<id>/session.v4.jsonl.zstd` 里的
+> `request/header`（`scripts/verify-session-tools.mjs` 不需要 cookie）。
+> 另外枚举窗口的 `capture-screen.ps1` 在部分会话里取不到 `$script:Pid2`（报 `NO_WINDOW`），
+> 改用按 `MainWindowHandle` 抓窗的 `capture-window.ps1`。
 
 通过标准（0.2.2-rc.3 实测值）：
 
@@ -62,7 +71,7 @@ Invoke-RestMethod "http://127.0.0.1:$port/api/mode-switch/detail?sessionId=<当�
 | 7 | `agent/pre-step` 载荷 `{ messages, agent, ...position }`，`position` 含 `turn`/`step` | 兜底应用（`turn===1 && step===1`） | 取不到 turn/step → 兜底失效（不影响主路径） | 未变 |
 | 8 | `system-prompt/assemble` 瀑布 `(assembly, context, next)`，`assembly.sections[].name` | 按档位删同名提示段 | 签名变 → 提示段裁剪失效 | 未变 |
 | 9 | cordis 监听器选项支持 `{ prepend: true }` | 提示段过滤要排在最外层 | 失去 outermost → 看不到别的插件追加的段 | 未变 |
-| 10 | `agents.turnBoundaryOf(session)` → `{ openTurnStartSeq, lastTurn }` | 判空白会话（决定能否选档、是否按默认档裁剪） | 读不到 → 全判成"未开始"，panel 把每个活跃会话都标成已固定 | **0.2.2-rc.5 换到这里**：旧的 `sessionProjections.stateOf(session, 'turnBoundary')` 已弃用，对新会话返回初始态/`undefined`，导致所有会话 `blank=true`；插件已改为优先 `turnBoundaryOf`，旧读法仅作回退 |
+| 10 | `agents.turnBoundaryOf(session)` → `{ openTurnStartSeq, lastTurn }` | 判空白会话（决定能否选档、是否按默认档裁剪） | 读不到 → 全判成"未开始"，panel 把每个活跃会话都标成已固定 | **0.2.3-alpha.2 实测**：旧的 `sessionProjections.stateOf(session, 'turnBoundary')` 已被标弃用并对新会话返回 `undefined`/初始态，导致所有会话 `blank=true`（rc.5 起是否已如此未复核）；插件已改为优先 `turnBoundaryOf`，旧读法仅作回退 |
 | 11 | `agents.get(id)` / `agents.list()` | 找活 agent、`tools/change` 时遍历 | 找不到 → 显示/刷新失效 | 未变 |
 | 12 | `webServer.register({ kind:'exact', path, handler })`，handler 是 `(req,res)` | 六条 `/api/mode-switch/*` 路由 | 路由 404 → 胶囊一直读取中 | 未变 |
 | 13 | 会话日志 `<home>/sessions/<bucket>/<id>/session.v4.jsonl.zstd`，**多帧** zstd | `verify` 的请求级证据 | 改文件名/单帧 → 证据为空 | 未变（2.4MB 会话解出 10 个请求） |
